@@ -93,7 +93,8 @@ class TelegramBot:
     # ── Per-scan summary ─────────────────────────────────────
     def send_scan_summary(self, scan_num: int, checked: int, total: int,
                           signals: list, account=None,
-                          scan_results: list = None) -> bool:
+                          scan_results: list = None,
+                          positions: list = None) -> bool:
         """
         Sends a rich per-scan summary to Telegram.
         scan_results: list of all symbol results (not just signals)
@@ -187,6 +188,33 @@ class TelegramBot:
                 ]
             except Exception:
                 pass
+
+        # ── Open Positions (ALL — including manually placed) ────
+        if positions is not None:
+            lines.append("")
+            if len(positions) == 0:
+                lines.append("Positions: None")
+            else:
+                lines.append(f"<b>Open Positions ({len(positions)}):</b>")
+                total_pl = 0.0
+                for p in positions:
+                    try:
+                        pl     = float(p.unrealized_pl)
+                        plpc   = float(p.unrealized_plpc) * 100
+                        qty    = float(p.qty)
+                        entry  = float(p.avg_entry_price)
+                        cur    = float(p.current_price)
+                        total_pl += pl
+                        sign   = "+" if pl >= 0 else ""
+                        lines.append(
+                            f"  <b>{p.symbol}</b>: {qty:.0f} sh "
+                            f"@ ${entry:.2f} → ${cur:.2f} "
+                            f"| P&amp;L: ${sign}{pl:.2f} ({sign}{plpc:.1f}%)"
+                        )
+                    except Exception:
+                        lines.append(f"  {p.symbol}: (data error)")
+                sign = "+" if total_pl >= 0 else ""
+                lines.append(f"  Total P&amp;L: <b>${sign}{total_pl:.2f}</b>")
 
         # ── Footer ────────────────────────────────────────────
         lines.append("")

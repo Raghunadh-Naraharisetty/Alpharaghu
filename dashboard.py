@@ -96,7 +96,6 @@ div[data-testid="stMetric"] [data-testid="stMetricValue"] { color: #e8e8f0; font
 
 
 # ── Module Loader ────────────────────────────────────────────
-@st.cache_resource
 def load_alpaca():
     def load_module(name, *parts):
         path = os.path.join(ROOT, *parts)
@@ -188,7 +187,7 @@ with st.sidebar:
     st.markdown("---")
 
     # Navigation
-    page = st.radio("", ["Dashboard", "Positions", "Signals", "Live Log"], label_visibility="hidden")
+    page = st.radio("", ["Dashboard", "Positions", "Signals", "Performance", "Live Log"], label_visibility="hidden")
 
     st.markdown("---")
 
@@ -228,8 +227,9 @@ if page == "Dashboard":
 
             st.markdown("")
 
-            # Positions summary
-            positions = client.get_positions()
+            # Positions — fetch fresh every time (shows manual trades too)
+            fresh_client, _ = load_alpaca()
+            positions = fresh_client.get_positions() if fresh_client else client.get_positions()
             col_left, col_right = st.columns([3, 2])
 
             with col_left:
@@ -282,41 +282,53 @@ if page == "Dashboard":
 
 elif page == "Positions":
     st.markdown("# Open Positions")
+    st.markdown("<small style='color:#6666aa'>Shows ALL positions — including manually placed trades</small>",
+                unsafe_allow_html=True)
     st.markdown("---")
 
     if client:
         try:
-            positions = client.get_positions()
+            # Always fetch fresh — no caching
+            client2, _ = load_alpaca()
+            positions = client2.get_positions() if client2 else client.get_positions()
+
             if not positions:
-                st.info("No open positions right now.")
+                st.info("No open positions right now. Manually placed trades appear here too.")
             else:
+                total_pl = sum(float(p.unrealized_pl) for p in positions)
+                total_val = sum(float(p.market_value) for p in positions)
+                sign = "+" if total_pl >= 0 else ""
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Total Positions", len(positions))
+                col2.metric("Total Market Value", f"${total_val:,.2f}")
+                col3.metric("Total Unrealized P&L", f"${sign}{total_pl:.2f}")
+                st.markdown("")
+
                 for p in positions:
                     pl   = float(p.unrealized_pl)
                     plpc = float(p.unrealized_plpc) * 100
                     color = "#00ff88" if pl >= 0 else "#ff4466"
-                    arrow = "+" if pl >= 0 else ""
-
+                    sign2 = "+" if pl >= 0 else ""
                     st.markdown(f"""
                     <div class="pos-card">
                         <div style="display:flex; justify-content:space-between; align-items:center;">
                             <div>
                                 <span style="font-size:1.4rem; font-weight:800; font-family:'Space Mono'">{p.symbol}</span>
-                                <span style="color:#6666aa; margin-left:12px; font-size:0.85rem">{float(p.qty)} shares</span>
+                                <span style="color:#6666aa; margin-left:12px; font-size:0.85rem">{float(p.qty):.0f} shares</span>
                             </div>
                             <div style="text-align:right;">
-                                <span style="color:{color}; font-family:'Space Mono'; font-size:1.2rem; font-weight:700">{arrow}${pl:.2f}</span>
-                                <span style="color:{color}; margin-left:8px; font-size:0.85rem">({arrow}{plpc:.2f}%)</span>
+                                <span style="color:{color}; font-family:'Space Mono'; font-size:1.2rem; font-weight:700">{sign2}${pl:.2f}</span>
+                                <span style="color:{color}; margin-left:8px; font-size:0.85rem">({sign2}{plpc:.2f}%)</span>
                             </div>
                         </div>
                         <div style="display:flex; gap:24px; margin-top:10px; color:#6666aa; font-size:0.82rem">
                             <span>Avg Entry: <b style="color:#e8e8f0">${float(p.avg_entry_price):.2f}</b></span>
                             <span>Current:   <b style="color:#e8e8f0">${float(p.current_price):.2f}</b></span>
-                            <span>Value:     <b style="color:#e8e8f0">${float(p.market_value):,.2f}</b></span>
+                            <span>Mkt Value: <b style="color:#e8e8f0">${float(p.market_value):,.2f}</b></span>
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
 
-                # Close position buttons
                 st.markdown("---")
                 st.markdown("### Close Positions")
                 cols = st.columns(min(len(positions), 4))
@@ -329,7 +341,8 @@ elif page == "Positions":
                             st.rerun()
 
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"Error loading positions: {e}")
+            st.info("Try clicking Refresh Now in the sidebar.")
 
 
 elif page == "Signals":
@@ -356,6 +369,80 @@ elif page == "Signals":
             </div>
             """, unsafe_allow_html=True)
 
+
+elif page == "Performance":
+    st.markdown("# Performance & Risk")
+    st.markdown("---")
+
+    # Load database
+    import importlib.util as _ilu, sys as _sys
+    try:
+        _spec = _ilu.spec_from_file_location("trade_db2",
+                    os.path.join(ROOT, "utils", "trade_database.py"))
+        _mod = _ilu.module_from_spec(_spec)
+        _sys.modules["trade_db2"] = _mod
+        _spec.loader.exec_module(_mod)
+        db = _mod.TradeDatabase()
+        perf   = db.get_performance()
+        trades = db.get_recent_trades(50)
+
+        if perf.get("total_trades", 0) == 0:
+            st.info("No completed trades yet. Performance stats appear here once trades are closed.")
+        else:
+            c1,c2,c3,c4 = st.columns(4)
+            c1.metric("Total Trades",   perf["total_trades"])
+            c2.metric("Win Rate",       f"{perf['win_rate']}%")
+            c3.metric("Profit Factor",  perf["profit_factor"])
+            c4.metric("Total P&L",      f"${perf['total_pnl']:+,.2f}")
+
+            st.markdown("")
+            c1,c2 = st.columns(2)
+            c1.metric("Avg Win",   f"${perf['avg_win']:+,.2f}")
+            c2.metric("Avg Loss",  f"-${perf['avg_loss']:,.2f}")
+
+            st.markdown("---")
+            st.markdown("### Recent Trades")
+            if trades:
+                import pandas as pd
+                df = pd.DataFrame(trades)
+                display_cols = [c for c in
+                    ["symbol","side","qty","entry_price","exit_price",
+                     "pnl","pnl_pct","exit_reason","entry_time"]
+                    if c in df.columns]
+                st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
+
+    except Exception as e:
+        st.error(f"Could not load trade database: {e}")
+
+    # Risk status
+    st.markdown("---")
+    st.markdown("### Risk Status")
+    try:
+        _spec2 = _ilu.spec_from_file_location("risk_mod2",
+                     os.path.join(ROOT, "utils", "risk_manager.py"))
+        _rmod = _ilu.module_from_spec(_spec2)
+        _sys.modules["risk_mod2"] = _rmod
+        _spec2.loader.exec_module(_rmod)
+        fresh_client, _cfg = load_alpaca()
+        if fresh_client:
+            rm     = _rmod.RiskManager(fresh_client)
+            status = rm.get_status()
+            c1,c2,c3 = st.columns(3)
+            c1.metric("Drawdown from Peak", f"{status['drawdown_pct']:.1f}%")
+            c2.metric("Day P&L %",          f"{status['daily_pnl_pct']:+.1f}%")
+            halted = status["halted"]
+            c3.markdown(
+                f"<div style='padding:16px;background:#0f0f1a;border:1px solid "
+                f"{'#ff4466' if halted else '#00ff88'};border-radius:8px'>"
+                f"<div style='color:#6666aa;font-size:0.75rem;text-transform:uppercase'>Bot Status</div>"
+                f"<div style='color:{'#ff4466' if halted else '#00ff88'};font-size:1.4rem;font-weight:800'>"
+                f"{'HALTED' if halted else 'ACTIVE'}</div></div>",
+                unsafe_allow_html=True
+            )
+            if status["trailing_active"]:
+                st.info(f"Trailing stops active: {', '.join(status['trailing_active'])}")
+    except Exception as e:
+        st.warning(f"Risk status unavailable: {e}")
 
 elif page == "Live Log":
     st.markdown("# Live Log")
