@@ -100,21 +100,47 @@ class AlpacaClient:
     # ── Orders ──────────────────────────────────────────────
     def place_market_order(self, symbol: str, qty: float, side: str,
                            stop_loss: float = None, take_profit: float = None):
-        """Place a bracket market order (with stop loss + take profit)"""
+        """
+        Place a bracket market order (with stop loss + take profit).
+
+        Alpaca rules we must follow:
+          1. Bracket orders require WHOLE share quantities (no fractions)
+          2. stop_price must be <= base_price - 0.01  (round DOWN)
+          3. take_profit must be >= base_price + 0.01 (round UP)
+        """
+        import math
         try:
             order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
 
+            # ── Fix 1: Whole shares for bracket orders ────────
+            # Alpaca rejects fractional qty with bracket/OCO orders
+            whole_qty = max(1, int(qty))   # floor to whole number, minimum 1
+
             if stop_loss and take_profit:
+                # ── Fix 2: Safe stop price (always round DOWN) ─
+                # Must be at least $0.01 below base price
+                safe_stop   = math.floor(stop_loss   * 100) / 100
+
+                # ── Fix 3: Safe target price (always round UP) ─
+                # Must be at least $0.01 above base price
+                safe_target = math.ceil(take_profit  * 100) / 100
+
+                logger.info(
+                    f"[ORDER PREP] {symbol}: qty={whole_qty} "
+                    f"stop=${safe_stop:.2f} target=${safe_target:.2f}"
+                )
+
                 req = MarketOrderRequest(
                     symbol=symbol,
-                    qty=round(qty, 2),
+                    qty=whole_qty,
                     side=order_side,
                     time_in_force=TimeInForce.DAY,
                     order_class=OrderClass.BRACKET,
-                    stop_loss={"stop_price": round(stop_loss, 2)},
-                    take_profit={"limit_price": round(take_profit, 2)},
+                    stop_loss={"stop_price": safe_stop},
+                    take_profit={"limit_price": safe_target},
                 )
             else:
+                # Simple market order — fractional OK here
                 req = MarketOrderRequest(
                     symbol=symbol,
                     qty=round(qty, 2),
@@ -123,7 +149,7 @@ class AlpacaClient:
                 )
 
             order = self.trading.submit_order(req)
-            logger.info(f"[ORDER]: {side.upper()} {qty:.2f} {symbol}")
+            logger.info(f"[ORDER PLACED]: {side.upper()} {whole_qty} shares {symbol}")
             return order
 
         except APIError as e:
@@ -253,15 +279,25 @@ class AlpacaClient:
 
     # ── Position Sizing ─────────────────────────────────────
     def calculate_position_size(self, price: float, stop_price: float) -> float:
-        """Risk-based position sizing: risk 2% of portfolio per trade"""
+        """
+        Risk-based position sizing: risk 2% of portfolio per trade.
+        Returns float — caller must convert to int for bracket orders.
+        Minimum 1 whole share required for bracket orders.
+        """
         portfolio      = self.get_portfolio_value()
         risk_amount    = portfolio * (config.RISK_PER_TRADE_PCT / 100)
         risk_per_share = abs(price - stop_price)
-        if risk_per_share == 0:
+        if risk_per_share < 0.01:
+            logger.warning(f"[SIZE] Stop too close to price (${risk_per_share:.4f}) — skipping")
             return 0
         qty     = risk_amount / risk_per_share
         max_qty = config.MAX_POSITION_SIZE / price
-        return round(min(qty, max_qty), 2)
+        final   = min(qty, max_qty)
+        # Ensure at least 1 whole share (bracket orders require whole shares)
+        if final < 1.0:
+            logger.info(f"[SIZE] Qty {final:.2f} < 1 share — using 1 share minimum")
+            return 1.0
+        return round(final, 2)
 
     # ── Market Status ────────────────────────────────────────
     def is_market_open(self) -> bool:
