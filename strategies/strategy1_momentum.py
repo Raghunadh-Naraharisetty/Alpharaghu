@@ -73,7 +73,7 @@ class MomentumStrategy:
           indicators: dict
         }
         """
-        if len(df) < max(self.ema_period, self.macd_slow + self.macd_signal) + 10:
+        if len(df) < 60:  # Need at least 60 bars minimum
             return self._no_signal("Not enough data")
 
         close  = df["close"]
@@ -112,13 +112,13 @@ class MomentumStrategy:
         # ── BUY Conditions ────────────────────────────────────
         above_ema200     = latest_close > latest_ema200
         above_ema50      = latest_close > latest_ema50
-        rsi_cross_up     = prev_rsi < 50 and latest_rsi >= 50
+        rsi_cross_up     = prev_rsi < 52 and latest_rsi >= 48  # Wider band
         macd_cross_up    = prev_macd < prev_sig and latest_macd >= latest_sig
         volume_confirmed = latest_vol > avg_vol_val * self.volume_multiplier
         rsi_not_overbought = latest_rsi < 75
 
         buy_score = sum([
-            above_ema200     * 1.5,
+            above_ema200     * 1.0,  # Reduced — EMA200 too strict on 15min
             above_ema50      * 0.5,
             rsi_cross_up     * 2.0,
             macd_cross_up    * 2.0,
@@ -129,7 +129,7 @@ class MomentumStrategy:
 
         # ── SELL Conditions ───────────────────────────────────
         below_ema200   = latest_close < latest_ema200
-        rsi_cross_down = prev_rsi > 50 and latest_rsi <= 50
+        rsi_cross_down = prev_rsi > 48 and latest_rsi <= 52  # Wider band
         macd_cross_down = prev_macd > prev_sig and latest_macd <= latest_sig
         rsi_overbought = latest_rsi > 75
 
@@ -145,7 +145,7 @@ class MomentumStrategy:
         buy_strength  = buy_score  / buy_max
         sell_strength = sell_score / sell_max
 
-        if buy_strength >= 0.60 and buy_strength > sell_strength:
+        if buy_strength >= 0.45 and buy_strength > sell_strength:
             reasons = []
             if above_ema200:     reasons.append("price above EMA200")
             if rsi_cross_up:     reasons.append(f"RSI crossed 50 ({latest_rsi:.1f})")
@@ -158,7 +158,7 @@ class MomentumStrategy:
                 "indicators": indicators
             }
 
-        elif sell_strength >= 0.55 and sell_strength > buy_strength:
+        elif sell_strength >= 0.45 and sell_strength > buy_strength:
             reasons = []
             if below_ema200:    reasons.append("price below EMA200")
             if rsi_cross_down:  reasons.append(f"RSI dropped below 50 ({latest_rsi:.1f})")

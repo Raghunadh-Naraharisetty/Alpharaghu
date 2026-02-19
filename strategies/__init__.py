@@ -76,11 +76,12 @@ class StrategyCombiner:
         confidence   = 0.0
         consensus    = 0
 
-        if buy_consensus >= 2 or (buy_consensus == 1 and buy_conf >= 0.55):
+        # Trigger if: 2+ strategies agree, OR 1 strategy with strong signal (40%+)
+        if buy_consensus >= 2 or (buy_consensus == 1 and buy_conf >= 0.40):
             final_signal = "BUY"
             confidence   = round(buy_conf, 2)
             consensus    = buy_consensus
-        elif sell_consensus >= 2 or (sell_consensus == 1 and sell_conf >= 0.55):
+        elif sell_consensus >= 2 or (sell_consensus == 1 and sell_conf >= 0.40):
             final_signal = "SELL"
             confidence   = round(sell_conf, 2)
             consensus    = sell_consensus

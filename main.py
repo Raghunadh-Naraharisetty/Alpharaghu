@@ -1,61 +1,51 @@
 """
 ALPHARAGHU - Main Trading Engine
-Windows-compatible, mobile-controllable via Telegram
+Scan notifications to Telegram + mobile commands
 """
-import sys
-import os
-import importlib.util
-import logging
-import time
-import schedule
-import json
+import sys, os, importlib.util, logging, time, schedule, json
 from datetime import datetime
 
 os.environ["PYTHONUTF8"] = "1"
-
 ROOT = os.path.dirname(os.path.abspath(__file__))
 os.chdir(ROOT)
 os.makedirs(os.path.join(ROOT, "logs"), exist_ok=True)
 
 # ── Logging ──────────────────────────────────────────────────
-log_format = logging.Formatter("%(asctime)s [%(name)s] %(levelname)s - %(message)s")
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setFormatter(log_format)
-file_handler = logging.FileHandler(os.path.join(ROOT, "logs", "alpharaghu.log"), encoding="utf-8")
-file_handler.setFormatter(log_format)
-logging.basicConfig(level=logging.INFO, handlers=[console_handler, file_handler])
+fmt = logging.Formatter("%(asctime)s [%(name)s] %(levelname)s - %(message)s")
+ch  = logging.StreamHandler(sys.stdout)
+ch.setFormatter(fmt)
+fh  = logging.FileHandler(os.path.join(ROOT, "logs", "alpharaghu.log"), encoding="utf-8")
+fh.setFormatter(fmt)
+logging.basicConfig(level=logging.INFO, handlers=[ch, fh])
 logger = logging.getLogger("alpharaghu.engine")
 
-
-# ── Module Loader ─────────────────────────────────────────────
-def load_module(name, *path_parts):
-    abs_path = os.path.join(ROOT, *path_parts)
-    spec     = importlib.util.spec_from_file_location(name, abs_path)
-    mod      = importlib.util.module_from_spec(spec)
+# ── Module loader ────────────────────────────────────────────
+def load(name, *parts):
+    path = os.path.join(ROOT, *parts)
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod  = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
 
-
 logger.info("Loading modules...")
-config       = load_module("config",       "config.py")
-alpaca_mod   = load_module("alpaca_client","broker", "alpaca_client.py")
-s1_mod       = load_module("strategy1",   "strategies", "strategy1_momentum.py")
-s2_mod       = load_module("strategy2",   "strategies", "strategy2_mean_reversion.py")
-s3_mod       = load_module("strategy3",   "strategies", "strategy3_news_sentiment.py")
-combiner_mod = load_module("combiner",    "strategies", "__init__.py")
-tg_mod       = load_module("telegram_bot","notifications", "telegram_bot.py")
-news_mod     = load_module("news_fetcher","data", "news_fetcher.py")
+config       = load("config",        "config.py")
+alpaca_mod   = load("alpaca_client", "broker",         "alpaca_client.py")
+_            = load("strategy1",     "strategies",     "strategy1_momentum.py")
+_            = load("strategy2",     "strategies",     "strategy2_mean_reversion.py")
+_            = load("strategy3",     "strategies",     "strategy3_news_sentiment.py")
+combiner_mod = load("combiner",      "strategies",     "__init__.py")
+tg_mod       = load("telegram_bot",  "notifications",  "telegram_bot.py")
+news_mod     = load("news_fetcher",  "data",           "news_fetcher.py")
 
-AlpacaClient         = alpaca_mod.AlpacaClient
-StrategyCombiner     = combiner_mod.StrategyCombiner
-TelegramBot          = tg_mod.TelegramBot
+AlpacaClient           = alpaca_mod.AlpacaClient
+StrategyCombiner       = combiner_mod.StrategyCombiner
+TelegramBot            = tg_mod.TelegramBot
 TelegramCommandHandler = tg_mod.TelegramCommandHandler
-NewsFetcher          = news_mod.NewsFetcher
+NewsFetcher            = news_mod.NewsFetcher
 logger.info("All modules loaded OK")
 
-
-# ── Signal Logger (feeds Streamlit dashboard) ─────────────────
+# ── Signal & state log helpers ───────────────────────────────
 SIGNAL_LOG = os.path.join(ROOT, "logs", "signals.json")
 STATE_FILE  = os.path.join(ROOT, "logs", "bot_state.json")
 
@@ -75,23 +65,20 @@ def log_signal(result: dict):
         "reason":     " | ".join(result.get("reason_lines", []))[:200],
         "time":       datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     })
-    signals = signals[-200:]  # Keep last 200
     with open(SIGNAL_LOG, "w") as f:
-        json.dump(signals, f)
+        json.dump(signals[-200:], f)
 
-def is_bot_paused() -> bool:
-    """Check if Telegram /stop command was issued"""
+def is_paused() -> bool:
     try:
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE) as f:
-                state = json.load(f)
-            return not state.get("running", True)
+                return not json.load(f).get("running", True)
     except Exception:
         pass
     return False
 
 
-# ── Engine ─────────────────────────────────────────────────────
+# ── Engine ────────────────────────────────────────────────────
 class AlpharaghuEngine:
 
     def __init__(self):
@@ -104,138 +91,163 @@ class AlpharaghuEngine:
         self.combiner = StrategyCombiner()
         self.news     = NewsFetcher(alpaca_client=self.alpaca)
 
+        self.scan_count   = 0
+        self.signal_count = 0
         self.active_signals = {}
-        self.scan_count     = 0
 
-        # Start Telegram command handler (mobile control)
+        # Start Telegram command handler (mobile /start /stop /status)
         self.cmd_handler = TelegramCommandHandler(self.telegram, engine_ref=self)
         self.cmd_handler.start_background()
-        logger.info("Telegram command handler running. Control bot from your phone!")
+        logger.info("[CMD] Telegram commands ready (/start /stop /status /positions /help)")
 
-    def get_symbols_to_scan(self):
+    def get_symbols(self) -> list:
         symbols = list(config.WATCHLIST)
         if config.USE_DYNAMIC_SCANNER:
-            top_movers = self.alpaca.get_top_movers(top_n=15)
-            symbols    = list(set(symbols + top_movers))
-        logger.info(f"Scanning {len(symbols)} symbols")
+            symbols = list(set(symbols + self.alpaca.get_top_movers(top_n=15)))
         return symbols
 
     def run_scan(self):
-        if is_bot_paused():
-            logger.info("Bot paused by Telegram /stop command - skipping scan")
+        if is_paused():
+            logger.info("Bot paused (/stop received) - skipping scan")
             return
-
         if not self.alpaca.is_market_open():
             logger.info("Market closed - skipping scan")
             return
 
         self.scan_count += 1
-        logger.info(f"--- Scan #{self.scan_count} | {datetime.now().strftime('%H:%M:%S')} ---")
-
-        symbols        = self.get_symbols_to_scan()
+        symbols        = self.get_symbols()
         open_positions = self.alpaca.get_open_position_count()
+        scan_signals   = []   # signals only (BUY/SELL)
+        all_results    = []   # every symbol result for "near signals"
+
+        logger.info(f"--- Scan #{self.scan_count} | {len(symbols)} symbols ---")
 
         for symbol in symbols:
             try:
-                self._analyze_symbol(symbol, open_positions)
+                result = self._analyze_symbol(symbol, open_positions)
+                if result:
+                    all_results.append(result)
+                    if result.get("signal") in ("BUY", "SELL"):
+                        scan_signals.append(result)
+                        self.signal_count += 1
                 time.sleep(0.3)
             except Exception as e:
-                logger.error(f"Error processing {symbol}: {e}")
-                self.telegram.send_error(f"{symbol}: {str(e)[:200]}")
+                logger.error(f"Error on {symbol}: {e}")
 
-    def _analyze_symbol(self, symbol, open_positions):
-        df_15min = self.alpaca.get_bars(symbol, timeframe="15Min", limit=250)
-        df_daily = self.alpaca.get_bars(symbol, timeframe="1Day",  limit=252)
+        # Send per-scan summary to Telegram
+        try:
+            acct = self.alpaca.get_account()
+            self.telegram.send_scan_summary(
+                scan_num=self.scan_count,
+                checked=len(symbols),
+                total=len(symbols),
+                signals=scan_signals,
+                account=acct,
+                scan_results=all_results,
+            )
+        except Exception as e:
+            logger.error(f"Scan summary send error: {e}")
 
-        if df_15min.empty or len(df_15min) < 50:
-            logger.debug(f"  {symbol}: insufficient data, skipping")
-            return
+    def _analyze_symbol(self, symbol: str, open_positions: int):
+        df_15  = self.alpaca.get_bars(symbol, timeframe="15Min", limit=250)
+        df_day = self.alpaca.get_bars(symbol, timeframe="1Day",  limit=252)
 
-        news_articles = self.news.get_all_news(symbol)
-        result        = self.combiner.run(symbol, df_15min, df_daily, news_articles)
+        if df_15.empty or len(df_15) < 50:
+            return None
 
-        signal     = result["signal"]
-        confidence = result["confidence"]
-        consensus  = result["consensus"]
+        news   = self.news.get_all_news(symbol)
+        result = self.combiner.run(symbol, df_15, df_day, news)
 
-        logger.info(f"  {symbol}: {signal} | conf:{confidence:.0%} | consensus:{consensus}/3")
+        signal = result["signal"]
+        conf   = result["confidence"]
+        cons   = result["consensus"]
+        bc     = result.get("buy_confidence", 0)
+        sc     = result.get("sell_confidence", 0)
+
+        # Show near-signals in log too (buy or sell conf > 25%)
+        if bc > 0.25 or sc > 0.25:
+            logger.info(f"  {symbol}: {signal} | {conf:.0%} | {cons}/3 "
+                       f"[BUY:{bc:.0%} SELL:{sc:.0%}] <-- NEAR SIGNAL")
+        else:
+            logger.info(f"  {symbol}: {signal} | {conf:.0%} | {cons}/3")
 
         if signal == "HOLD":
-            return
+            return result   # Return HOLD too so near-signals can be tracked
 
-        last_sig  = self.active_signals.get(symbol, {})
-        last_time = last_sig.get("time", datetime(2000, 1, 1))
-        if last_sig.get("signal") == signal and (datetime.now() - last_time).seconds < 1800:
-            logger.debug(f"  {symbol}: duplicate signal suppressed")
-            return
+        # Deduplicate within 30 min
+        last = self.active_signals.get(symbol, {})
+        if (last.get("signal") == signal and
+                (datetime.now() - last.get("time", datetime(2000,1,1))).seconds < 1800):
+            return None
 
-        current_position = self.alpaca.get_position(symbol)
-        price = df_15min["close"].iloc[-1]
+        price = df_15["close"].iloc[-1]
+        pos   = self.alpaca.get_position(symbol)
 
-        if signal == "BUY" and not current_position:
-            if open_positions < config.MAX_OPEN_POSITIONS:
-                self._execute_buy(symbol, price, result)
+        if signal == "BUY" and not pos and open_positions < config.MAX_OPEN_POSITIONS:
+            stop   = price * (1 - config.STOP_LOSS_PCT   / 100)
+            target = price * (1 + config.TAKE_PROFIT_PCT / 100)
+            qty    = self.alpaca.calculate_position_size(price, stop)
+            if qty >= 0.01:
+                order = self.alpaca.place_market_order(symbol, qty, "buy", stop, target)
+                if order:
+                    result["targets"] = {
+                        "entry": round(price, 2),
+                        "stop":  round(stop, 2),
+                        "target": round(target, 2),
+                    }
+                    self.telegram.send_signal(result)
 
-        elif signal == "SELL" and current_position:
-            self._execute_sell(symbol, price, result, current_position)
+        elif signal == "SELL" and pos:
+            self.alpaca.close_position(symbol)
+            self.telegram.send_signal(result)
 
-        self.telegram.send_signal(result)
-        log_signal(result)  # Save to dashboard log
+        log_signal(result)
         self.active_signals[symbol] = {"signal": signal, "time": datetime.now()}
-
-    def _execute_buy(self, symbol, price, result):
-        stop_price   = price * (1 - config.STOP_LOSS_PCT   / 100)
-        target_price = price * (1 + config.TAKE_PROFIT_PCT / 100)
-        qty          = self.alpaca.calculate_position_size(price, stop_price)
-
-        if qty < 0.01:
-            logger.warning(f"  {symbol}: position size too small, skipping")
-            return
-
-        order = self.alpaca.place_market_order(
-            symbol=symbol, qty=qty, side="buy",
-            stop_loss=stop_price, take_profit=target_price,
-        )
-        if order:
-            logger.info(f"  [BUY FILLED] {qty:.2f} x {symbol} @ ~${price:.2f}")
-            result["targets"] = {
-                "entry":  round(price, 2),
-                "stop":   round(stop_price, 2),
-                "target": round(target_price, 2),
-            }
-
-    def _execute_sell(self, symbol, price, result, position):
-        self.alpaca.close_position(symbol)
-        try:
-            pl = float(position.unrealized_pl)
-            logger.info(f"  [SELL FILLED] {symbol} | P&L: ${pl:+.2f}")
-        except Exception:
-            logger.info(f"  [SELL FILLED] {symbol}")
+        return result
 
     def send_daily_summary(self):
         try:
-            account   = self.alpaca.get_account()
-            positions = self.alpaca.get_positions()
-            self.telegram.send_portfolio_summary(account, positions)
+            self.telegram.send_portfolio_summary(
+                self.alpaca.get_account(),
+                self.alpaca.get_positions()
+            )
         except Exception as e:
             logger.error(f"Daily summary error: {e}")
 
     def run(self):
         logger.info("Engine starting...")
-        self.telegram.send_startup_message()
+        symbols = self.get_symbols()
+        self.telegram.send_startup(len(symbols), symbols)
+
+        # Log all positions including manually placed ones
+        positions = self.alpaca.get_positions()
+        if positions:
+            logger.info(f"  Found {len(positions)} existing position(s):")
+            for p in positions:
+                pl = float(p.unrealized_pl)
+                logger.info(f"    {p.symbol}: {p.qty} shares @ "
+                           f"${float(p.avg_entry_price):.2f} | P&L: ${pl:+.2f}")
+        else:
+            logger.info("  No existing positions")
 
         schedule.every(config.SCAN_INTERVAL_MINUTES).minutes.do(self.run_scan)
         schedule.every().day.at("16:05").do(self.send_daily_summary)
 
-        self.run_scan()
+        self.run_scan()  # immediate first scan
 
-        logger.info(f"Scanning every {config.SCAN_INTERVAL_MINUTES} min. Press Ctrl+C to stop.")
+        logger.info(f"Scanning every {config.SCAN_INTERVAL_MINUTES} min. Ctrl+C to stop.")
         try:
             while True:
                 schedule.run_pending()
                 time.sleep(30)
         except KeyboardInterrupt:
-            logger.info("Bot stopped by user (Ctrl+C).")
+            logger.info("Stopping bot...")
+            try:
+                acct = self.alpaca.get_account()
+            except Exception:
+                acct = None
+            self.telegram.send_stopped(self.scan_count, self.signal_count, acct)
+            logger.info("Bot stopped.")
 
 
 if __name__ == "__main__":

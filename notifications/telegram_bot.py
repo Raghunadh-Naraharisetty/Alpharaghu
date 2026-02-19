@@ -1,329 +1,443 @@
 """
-ALPHARAGHU - Telegram Signal Bot
-Sends formatted trading signals to your Telegram group
+ALPHARAGHU - Telegram Bot
+Fixed commands + rich scan notifications
 """
 import logging
-import asyncio
-import aiohttp
+import threading
+import requests
+import json
+import os
+import time
 from datetime import datetime
-from typing import Optional
-import config
 
 logger = logging.getLogger("alpharaghu.telegram")
 
+# ── Load config safely ───────────────────────────────────────
+import sys
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if "config" in sys.modules:
+    config = sys.modules["config"]
+else:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("config", os.path.join(ROOT, "config.py"))
+    config = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config)
+
 
 class TelegramBot:
-    BASE_URL = "https://api.telegram.org/bot{token}/{method}"
+    BASE = "https://api.telegram.org/bot{token}/{method}"
 
     def __init__(self):
         self.token   = config.TELEGRAM_BOT_TOKEN
-        self.chat_id = config.TELEGRAM_CHAT_ID
-        self._enabled = bool(self.token and self.chat_id)
-        if not self._enabled:
-            logger.warning("[WARN] Telegram not configured — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
+        self.chat_id = str(config.TELEGRAM_CHAT_ID)
+        self.enabled = bool(self.token and self.chat_id and
+                           self.token != "your_telegram_bot_token_here")
+        if not self.enabled:
+            logger.warning("[TELEGRAM] Not configured - set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env")
 
-    # ── Core Send ────────────────────────────────────────────
-    async def _send_async(self, text: str, parse_mode: str = "HTML") -> bool:
-        if not self._enabled:
-            logger.info(f"[TELEGRAM DISABLED] Would send:\n{text}")
+    # ── Core send ────────────────────────────────────────────
+    def send(self, text: str, parse_mode: str = "HTML") -> bool:
+        if not self.enabled:
+            logger.info(f"[TELEGRAM DISABLED] {text[:80]}")
             return False
-        url = self.BASE_URL.format(token=self.token, method="sendMessage")
+        url     = self.BASE.format(token=self.token, method="sendMessage")
         payload = {
-            "chat_id":    self.chat_id,
-            "text":       text,
-            "parse_mode": parse_mode,
+            "chat_id":                  self.chat_id,
+            "text":                     text,
+            "parse_mode":               parse_mode,
             "disable_web_page_preview": True,
         }
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        return True
-                    else:
-                        body = await resp.text()
-                        logger.error(f"Telegram error {resp.status}: {body}")
-                        return False
+            r = requests.post(url, json=payload, timeout=10)
+            if r.status_code == 200:
+                return True
+            else:
+                logger.error(f"Telegram error {r.status_code}: {r.text[:200]}")
+                return False
         except Exception as e:
             logger.error(f"Telegram send failed: {e}")
             return False
 
-    def send(self, text: str) -> bool:
-        """Synchronous wrapper for sending messages"""
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Schedule the coroutine
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    future = pool.submit(asyncio.run, self._send_async(text))
-                    return future.result(timeout=15)
-            else:
-                return loop.run_until_complete(self._send_async(text))
-        except Exception as e:
-            logger.error(f"Send error: {e}")
+    # ── Startup message ──────────────────────────────────────
+    def send_startup(self, symbol_count: int, watchlist: list) -> bool:
+        now = datetime.now().strftime("%H:%M:%S")
+        dynamic_extra = 15 if getattr(config, "USE_DYNAMIC_SCANNER", True) else 0
+        total_symbols = symbol_count + dynamic_extra
+        scanner_note  = (
+            f"{symbol_count} watchlist + ~{dynamic_extra} top movers (dynamic)"
+            if dynamic_extra else f"{symbol_count} watchlist only"
+        )
+        msg = (
+            f"<b>ALPHARAGHU Bot Started</b>\n\n"
+            f"Interval: {config.SCAN_INTERVAL_MINUTES}m\n"
+            f"Watching: ~{total_symbols} symbols\n"
+            f"  ({scanner_note})\n\n"
+            f"<b>Strategy 1 - Momentum:</b>\n"
+            f"  EMA50, EMA200, RSI(14), MACD(12/26/9), Volume\n\n"
+            f"<b>Strategy 2 - Mean Reversion:</b>\n"
+            f"  Bollinger Bands(20), Stochastic(14/3), ATR(14)\n\n"
+            f"<b>Strategy 3 - News Sentiment:</b>\n"
+            f"  Alpaca News, Earnings Growth, Revenue Growth\n\n"
+            f"Consensus: 2/3 strategies must agree\n"
+            f"News filter: ON\n"
+            f"Earnings guard: ON\n"
+            f"Risk/trade: {config.RISK_PER_TRADE_PCT}% | "
+            f"Stop: {config.STOP_LOSS_PCT}% | "
+            f"Target: {config.TAKE_PROFIT_PCT}%\n"
+            f"Max positions: {config.MAX_OPEN_POSITIONS}\n"
+            f"Time: {now}\n\n"
+            f"<i>Scan summary sent every {config.SCAN_INTERVAL_MINUTES}m</i>"
+        )
+        return self.send(msg)
+
+    # ── Per-scan summary ─────────────────────────────────────
+    def send_scan_summary(self, scan_num: int, checked: int, total: int,
+                          signals: list, account=None,
+                          scan_results: list = None) -> bool:
+        """
+        Sends a rich per-scan summary to Telegram.
+        scan_results: list of all symbol results (not just signals)
+        """
+        now     = datetime.now().strftime("%H:%M:%S")
+        sig_buy  = [s for s in signals if s.get("signal") == "BUY"]
+        sig_sell = [s for s in signals if s.get("signal") == "SELL"]
+
+        # ── Header ───────────────────────────────────────────
+        lines = [
+            f"<b>Scan #{scan_num}</b>   {now}",
+            f"",
+            f"Checked: {checked}/{total} symbols",
+            f"Signals: {len(signals)}  "
+            f"(BUY: {len(sig_buy)}  SELL: {len(sig_sell)})",
+        ]
+
+        # ── BUY signals ───────────────────────────────────────
+        if sig_buy:
+            lines.append("")
+            lines.append("<b>BUY Signals:</b>")
+            for s in sig_buy:
+                conf = s.get("confidence", 0)
+                cons = s.get("consensus", 0)
+                t    = s.get("targets", {})
+                entry  = t.get("entry",  "?")
+                stop   = t.get("stop",   "?")
+                target = t.get("target", "?")
+                lines.append(
+                    f"  BUY <b>{s['symbol']}</b> "
+                    f"| {conf:.0%} conf | {cons}/3"
+                )
+                if entry != "?":
+                    lines.append(
+                        f"    Entry: ${entry}  Stop: ${stop}  TP: ${target}"
+                    )
+
+        # ── SELL signals ──────────────────────────────────────
+        if sig_sell:
+            lines.append("")
+            lines.append("<b>SELL Signals:</b>")
+            for s in sig_sell:
+                conf = s.get("confidence", 0)
+                cons = s.get("consensus", 0)
+                lines.append(
+                    f"  SELL <b>{s['symbol']}</b> "
+                    f"| {conf:.0%} conf | {cons}/3"
+                )
+
+        # ── No signals ────────────────────────────────────────
+        if not signals:
+            lines.append("")
+            lines.append("No signals this scan")
+
+        # ── Top movers watched (from scan_results) ────────────
+        if scan_results:
+            # Show top 5 by absolute confidence (closest to triggering)
+            near_signals = sorted(
+                [r for r in scan_results if r.get("signal") == "HOLD"
+                 and max(r.get("buy_confidence", 0), r.get("sell_confidence", 0)) > 0.35],
+                key=lambda x: max(x.get("buy_confidence", 0), x.get("sell_confidence", 0)),
+                reverse=True
+            )[:5]
+            if near_signals:
+                lines.append("")
+                lines.append("<b>Near Signals (watching):</b>")
+                for r in near_signals:
+                    bc  = r.get("buy_confidence",  0)
+                    sc  = r.get("sell_confidence", 0)
+                    if bc >= sc:
+                        direction = f"BUY  {bc:.0%}"
+                    else:
+                        direction = f"SELL {sc:.0%}"
+                    lines.append(f"  {r['symbol']}: {direction}")
+
+        # ── Portfolio ─────────────────────────────────────────
+        if account:
+            try:
+                portfolio = float(account.portfolio_value)
+                cash      = float(account.cash)
+                equity    = float(account.equity)
+                last_eq   = float(account.last_equity)
+                pl        = equity - last_eq
+                pl_pct    = (pl / last_eq * 100) if last_eq else 0
+                pl_sign   = "+" if pl >= 0 else ""
+                lines += [
+                    "",
+                    f"Portfolio: <b>${portfolio:,.2f}</b>",
+                    f"Cash: ${cash:,.2f}",
+                    f"Day P&amp;L: ${pl_sign}{pl:,.2f} ({pl_sign}{pl_pct:.2f}%)",
+                ]
+            except Exception:
+                pass
+
+        # ── Footer ────────────────────────────────────────────
+        lines.append("")
+        lines.append(f"<i>Next scan in {config.SCAN_INTERVAL_MINUTES}m</i>")
+
+        return self.send("\n".join(lines))
+
+    # ── Trade signal ─────────────────────────────────────────
+    def send_signal(self, result: dict) -> bool:
+        symbol    = result.get("symbol", "???")
+        signal    = result.get("signal", "HOLD")
+        conf      = result.get("confidence", 0)
+        consensus = result.get("consensus", 0)
+        if signal not in ("BUY", "SELL"):
             return False
 
-    # ── Signal Messages ──────────────────────────────────────
-    def send_signal(self, signal_data: dict) -> bool:
-        """
-        Send a formatted trading signal message.
-        signal_data from StrategyCombiner.run()
-        """
-        symbol    = signal_data.get("symbol", "???")
-        signal    = signal_data.get("signal", "HOLD")
-        conf      = signal_data.get("confidence", 0)
-        consensus = signal_data.get("consensus", 0)
-        ts        = datetime.now().strftime("%Y-%m-%d %H:%M ET")
+        direction = "BUY SIGNAL" if signal == "BUY" else "SELL SIGNAL"
+        strat_lines = result.get("reason_lines", [])
+        strat_text  = "\n".join(f"  {l}" for l in strat_lines)
 
-        if signal == "BUY":
-            emoji   = "🚀 BUY SIGNAL"
-            color   = "🟢"
-        elif signal == "SELL":
-            emoji   = "🔴 SELL SIGNAL"
-            color   = "🔴"
-        else:
-            return False  # Don't send HOLD signals
-
-        # Strategy breakdown
-        strat_lines = signal_data.get("reason_lines", [])
-        strat_text  = "\n".join(f"  {line}" for line in strat_lines)
-
-        # Entry/exit levels
-        targets = signal_data.get("targets", {})
-        target_text = ""
+        targets = result.get("targets", {})
+        t_text  = ""
         if targets:
-            entry  = targets.get("entry",  "—")
-            sl     = targets.get("stop",   "—")
-            tp     = targets.get("target", "—")
-            target_text = (
-                f"\n\n📌 <b>Levels</b>\n"
-                f"  Entry:        <code>${entry}</code>\n"
-                f"  Stop Loss:    <code>${sl}</code>\n"
-                f"  Take Profit:  <code>${tp}</code>"
+            t_text = (
+                f"\nEntry:       <code>${targets.get('entry','?')}</code>\n"
+                f"Stop Loss:   <code>${targets.get('stop','?')}</code>\n"
+                f"Take Profit: <code>${targets.get('target','?')}</code>"
             )
 
         msg = (
-            f"╔══════════════════════════╗\n"
-            f"  {emoji}  {color}\n"
-            f"╚══════════════════════════╝\n\n"
-            f"📊 <b>{symbol}</b>\n"
-            f"🕐 {ts}\n"
-            f"🎯 Confidence: <b>{conf:.0%}</b>  |  {consensus}/3 strategies agree\n"
-            f"{target_text}\n\n"
-            f"<b>Strategy Breakdown:</b>\n"
-            f"{strat_text}\n\n"
-            f"#alpharaghu #{symbol} #{signal.lower()}"
+            f"<b>{direction} — {symbol}</b>\n"
+            f"Confidence: {conf:.0%} | {consensus}/3 strategies\n"
+            f"{t_text}\n\n"
+            f"<b>Breakdown:</b>\n{strat_text}\n\n"
+            f"#{symbol.lower()} #{signal.lower()}"
         )
         return self.send(msg)
 
-    def send_order_fill(self, symbol: str, side: str, qty: float,
-                        price: float, order_id: str) -> bool:
-        emoji = "✅ ORDER FILLED"
-        side_txt = "BOUGHT" if side == "buy" else "SOLD"
+    # ── Order filled ─────────────────────────────────────────
+    def send_order_fill(self, symbol: str, side: str, qty: float, price: float) -> bool:
+        action = "BOUGHT" if side == "buy" else "SOLD"
         msg = (
-            f"{emoji}\n\n"
-            f"💼 <b>{side_txt} {symbol}</b>\n"
-            f"Qty:   {qty} shares\n"
+            f"<b>Order Filled — {action} {symbol}</b>\n"
+            f"Qty: {qty} shares\n"
             f"Price: <code>${price:.2f}</code>\n"
             f"Total: <code>${qty * price:,.2f}</code>\n"
-            f"Order: <code>{order_id}</code>\n"
-            f"🕐 {datetime.now().strftime('%H:%M:%S ET')}"
+            f"Time: {datetime.now().strftime('%H:%M:%S')}"
         )
         return self.send(msg)
 
-    def send_portfolio_summary(self, account: object, positions: list) -> bool:
-        equity    = float(account.equity)
-        cash      = float(account.cash)
-        pl        = float(account.equity) - float(account.last_equity)
-        pl_pct    = (pl / float(account.last_equity)) * 100 if float(account.last_equity) else 0
-        pl_emoji  = "📈" if pl >= 0 else "📉"
+    # ── Stopped message ──────────────────────────────────────
+    def send_stopped(self, scan_count: int, signal_count: int, account=None) -> bool:
+        portfolio = "N/A"
+        positions = "N/A"
+        if account:
+            try:
+                portfolio = f"${float(account.portfolio_value):,.2f}"
+            except Exception:
+                pass
+        msg = (
+            f"<b>Bot Stopped</b>\n\n"
+            f"Scans: {scan_count}\n"
+            f"Total signals: {signal_count}\n"
+            f"Final portfolio: {portfolio}\n"
+            f"Time: {datetime.now().strftime('%H:%M:%S')}"
+        )
+        return self.send(msg)
+
+    # ── Portfolio summary ────────────────────────────────────
+    def send_portfolio_summary(self, account, positions: list) -> bool:
+        equity = float(account.equity)
+        cash   = float(account.cash)
+        pl     = equity - float(account.last_equity)
+        pl_pct = (pl / float(account.last_equity)) * 100 if float(account.last_equity) else 0
 
         pos_lines = ""
         for p in positions:
             p_pl  = float(p.unrealized_pl)
             p_pct = float(p.unrealized_plpc) * 100
-            e     = "🟢" if p_pl >= 0 else "🔴"
             pos_lines += (
-                f"  {e} <b>{p.symbol}</b>: {p.qty} shares "
-                f"@ ${float(p.avg_entry_price):.2f} "
-                f"| P&L: ${p_pl:+.2f} ({p_pct:+.1f}%)\n"
+                f"  <b>{p.symbol}</b>: {p.qty} shares @ ${float(p.avg_entry_price):.2f}"
+                f" | P&amp;L: ${p_pl:+.2f} ({p_pct:+.1f}%)\n"
             )
 
         msg = (
-            f"📊 <b>ALPHARAGHU Daily Summary</b>\n"
-            f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M ET')}\n\n"
-            f"💰 Portfolio Value: <code>${equity:,.2f}</code>\n"
-            f"💵 Cash Available:  <code>${cash:,.2f}</code>\n"
-            f"{pl_emoji} Day P&L:         <code>${pl:+,.2f} ({pl_pct:+.2f}%)</code>\n\n"
-            f"<b>Open Positions ({len(positions)}):</b>\n"
-            f"{pos_lines if pos_lines else '  None\n'}\n"
-            f"#alpharaghu #daily"
+            f"<b>ALPHARAGHU Daily Summary</b>\n"
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+            f"Portfolio: <b>${equity:,.2f}</b>\n"
+            f"Cash: ${cash:,.2f}\n"
+            f"Day P&amp;L: ${pl:+,.2f} ({pl_pct:+.2f}%)\n\n"
+            f"<b>Positions ({len(positions)}):</b>\n"
+            f"{pos_lines if pos_lines else 'None'}"
         )
         return self.send(msg)
 
-    def send_startup_message(self) -> bool:
-        msg = (
-            f"🤖 <b>ALPHARAGHU Bot Started</b>\n"
-            f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M ET')}\n\n"
-            f"✅ Alpaca: Connected\n"
-            f"📡 Strategies: Momentum | Mean Reversion | News Sentiment\n"
-            f"🔍 Scanner: Active\n"
-            f"⚡ Status: Watching markets...\n\n"
-            f"#alpharaghu #started"
-        )
-        return self.send(msg)
+    def send_error(self, msg: str) -> bool:
+        return self.send(f"<b>Error</b>\n<code>{msg[:300]}</code>")
 
-    def send_error(self, error_msg: str) -> bool:
-        msg = f"⚠️ <b>ALPHARAGHU Error</b>\n\n<code>{error_msg[:300]}</code>"
-        return self.send(msg)
+    # ── Legacy alias ─────────────────────────────────────────
+    def send_startup_message(self):
+        return self.send_startup(len(config.WATCHLIST), config.WATCHLIST)
 
 
 # ─────────────────────────────────────────────────────────────
-# MOBILE CONTROL - Telegram Command Handler
-# Add this to your bot to control it from your phone!
-#
-# Setup:
-#   1. Open Telegram, message @BotFather
-#   2. Send /setcommands to your bot
-#   3. Paste:
-#        start - Start the trading bot
-#        stop - Stop the trading bot
-#        status - Get current bot status & portfolio
-#        positions - List open positions
-#        help - Show available commands
+# TELEGRAM COMMAND HANDLER (Mobile control)
 # ─────────────────────────────────────────────────────────────
-
-import threading
-import json
-import os
-
 class TelegramCommandHandler:
-    """
-    Polls Telegram for commands from your phone and acts on them.
-    Run this in a background thread alongside the main engine.
-    """
 
     COMMANDS = {
         "/start":     "Start the trading bot",
         "/stop":      "Stop the trading bot",
-        "/status":    "Show portfolio & bot status",
+        "/status":    "Get portfolio and bot status",
         "/positions": "Show open positions",
         "/help":      "Show available commands",
     }
 
     def __init__(self, bot: TelegramBot, engine_ref=None):
-        self.bot        = bot
-        self.engine     = engine_ref
-        self._offset    = 0
-        self._running   = True
-        self.state_file = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..", "logs", "bot_state.json"
-        )
+        self.bot      = bot
+        self.engine   = engine_ref
+        self._offset  = 0
+        self._running = True
+        self.state_file = os.path.join(ROOT, "logs", "bot_state.json")
+        os.makedirs(os.path.join(ROOT, "logs"), exist_ok=True)
 
-    def get_updates(self):
-        import requests
-        url = f"https://api.telegram.org/bot{self.bot.token}/getUpdates"
-        try:
-            resp = requests.get(url, params={"offset": self._offset, "timeout": 20}, timeout=25)
-            if resp.status_code == 200:
-                return resp.json().get("result", [])
-        except Exception:
-            pass
-        return []
-
-    def handle_command(self, text: str, chat_id: str):
-        text = text.strip().lower().split()[0]  # Get just the command
-
-        if text == "/start":
-            self._set_state(True)
-            self.bot.send("Bot STARTED. Scanning for signals every 15 min during market hours.")
-
-        elif text == "/stop":
-            self._set_state(False)
-            self.bot.send("Bot STOPPED. Send /start to resume.")
-
-        elif text == "/status":
-            state = self._get_state()
-            status = "RUNNING" if state.get("running") else "STOPPED"
-            since  = state.get("started_at", "N/A")
-            msg = (
-                f"<b>ALPHARAGHU Status</b>\n\n"
-                f"Bot: <b>{status}</b>\n"
-                f"Since: {since}\n"
-                f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M ET')}"
-            )
-            self.bot.send(msg)
-
-        elif text == "/positions":
-            try:
-                if self.engine and hasattr(self.engine, 'alpaca'):
-                    positions = self.engine.alpaca.get_positions()
-                    if not positions:
-                        self.bot.send("No open positions.")
-                    else:
-                        lines = ["<b>Open Positions:</b>\n"]
-                        for p in positions:
-                            pl = float(p.unrealized_pl)
-                            lines.append(
-                                f"  {p.symbol}: {p.qty} shares | "
-                                f"P&L: ${pl:+.2f} ({float(p.unrealized_plpc)*100:+.1f}%)"
-                            )
-                        self.bot.send("\n".join(lines))
-                else:
-                    self.bot.send("Engine not available for position data.")
-            except Exception as e:
-                self.bot.send(f"Error getting positions: {e}")
-
-        elif text == "/help":
-            lines = ["<b>ALPHARAGHU Commands:</b>\n"]
-            for cmd, desc in self.COMMANDS.items():
-                lines.append(f"  {cmd} - {desc}")
-            self.bot.send("\n".join(lines))
-
-        else:
-            self.bot.send(f"Unknown command: {text}\nSend /help for options.")
-
-    def _set_state(self, running: bool):
-        os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
-        state = {"running": running, "started_at": datetime.now().isoformat() if running else None}
+    # ── State file ───────────────────────────────────────────
+    def set_state(self, running: bool):
+        state = {
+            "running":    running,
+            "started_at": datetime.now().isoformat() if running else None,
+        }
         with open(self.state_file, "w") as f:
             json.dump(state, f)
 
-    def _get_state(self):
+    def get_state(self) -> dict:
         try:
             if os.path.exists(self.state_file):
                 with open(self.state_file) as f:
                     return json.load(f)
         except Exception:
             pass
-        return {"running": False}
+        return {"running": True}
 
-    def is_bot_running(self) -> bool:
-        return self._get_state().get("running", True)
+    def is_running(self) -> bool:
+        return self.get_state().get("running", True)
 
+    # ── Get updates from Telegram ────────────────────────────
+    def get_updates(self) -> list:
+        url = f"https://api.telegram.org/bot{self.bot.token}/getUpdates"
+        try:
+            r = requests.get(
+                url,
+                params={"offset": self._offset, "timeout": 10},
+                timeout=15
+            )
+            if r.status_code == 200:
+                return r.json().get("result", [])
+        except Exception as e:
+            logger.debug(f"getUpdates error: {e}")
+        return []
+
+    # ── Handle a command ────────────────────────────────────
+    def handle(self, text: str):
+        cmd = text.strip().split()[0].lower()
+        # Handle /command@botname format
+        if "@" in cmd:
+            cmd = cmd.split("@")[0]
+
+        logger.info(f"[CMD] Received: {cmd}")
+
+        if cmd == "/start":
+            self.set_state(True)
+            self.bot.send(
+                "<b>Bot STARTED</b>\n\n"
+                "Scanning for signals every "
+                f"{config.SCAN_INTERVAL_MINUTES} min during market hours.\n"
+                "Send /stop to pause."
+            )
+
+        elif cmd == "/stop":
+            self.set_state(False)
+            self.bot.send(
+                "<b>Bot STOPPED</b>\n\n"
+                "No new trades will be placed.\n"
+                "Send /start to resume."
+            )
+
+        elif cmd == "/status":
+            state  = self.get_state()
+            status = "RUNNING" if state.get("running") else "STOPPED"
+            since  = (state.get("started_at") or "N/A")[:16].replace("T", " ")
+            port   = "N/A"
+            if self.engine and hasattr(self.engine, "alpaca"):
+                try:
+                    port = f"${self.engine.alpaca.get_portfolio_value():,.2f}"
+                except Exception:
+                    pass
+            self.bot.send(
+                f"<b>ALPHARAGHU Status</b>\n\n"
+                f"Status: <b>{status}</b>\n"
+                f"Since: {since}\n"
+                f"Portfolio: {port}\n"
+                f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            )
+
+        elif cmd == "/positions":
+            if self.engine and hasattr(self.engine, "alpaca"):
+                try:
+                    positions = self.engine.alpaca.get_positions()
+                    if not positions:
+                        self.bot.send("No open positions.")
+                    else:
+                        lines = ["<b>Open Positions:</b>\n"]
+                        for p in positions:
+                            pl  = float(p.unrealized_pl)
+                            pct = float(p.unrealized_plpc) * 100
+                            lines.append(
+                                f"<b>{p.symbol}</b>: {p.qty} @ ${float(p.avg_entry_price):.2f}"
+                                f" | P&amp;L: ${pl:+.2f} ({pct:+.1f}%)"
+                            )
+                        self.bot.send("\n".join(lines))
+                except Exception as e:
+                    self.bot.send(f"Error: {e}")
+            else:
+                self.bot.send("Engine not available.")
+
+        elif cmd == "/help":
+            lines = ["<b>Available Commands:</b>\n"]
+            for c, d in self.COMMANDS.items():
+                lines.append(f"{c} - {d}")
+            self.bot.send("\n".join(lines))
+
+        else:
+            self.bot.send(f"Unknown command: {cmd}\nSend /help for options.")
+
+    # ── Background polling loop ───────────────────────────────
     def poll(self):
-        """Run in background thread — polls Telegram for commands"""
-        logger = logging.getLogger("alpharaghu.telegram.commands")
-        logger.info("Telegram command handler started. Control bot from your phone!")
+        logger.info("[CMD] Telegram command handler listening...")
         while self._running:
             try:
                 updates = self.get_updates()
-                for update in updates:
-                    self._offset = update["update_id"] + 1
-                    msg = update.get("message", {})
+                for upd in updates:
+                    self._offset = upd["update_id"] + 1
+                    msg  = upd.get("message") or upd.get("edited_message", {})
                     text = msg.get("text", "")
-                    chat = str(msg.get("chat", {}).get("id", ""))
                     if text.startswith("/"):
-                        logger.info(f"Command received: {text} from {chat}")
-                        self.handle_command(text, chat)
+                        self.handle(text)
             except Exception as e:
                 logger.error(f"Poll error: {e}")
-            import time as _time
-            _time.sleep(2)
+            time.sleep(2)
 
     def start_background(self):
-        """Launch polling in a daemon thread"""
-        t = threading.Thread(target=self.poll, daemon=True)
+        t = threading.Thread(target=self.poll, daemon=True, name="TelegramCmdHandler")
         t.start()
         return t

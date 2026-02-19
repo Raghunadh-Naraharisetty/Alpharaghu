@@ -82,7 +82,7 @@ class MeanReversionStrategy:
 
     # ── Signal Generation ────────────────────────────────────
     def generate_signal(self, df: pd.DataFrame) -> dict:
-        min_required = max(self.bb_period, self.rsi_period, self.stoch_k) + 20
+        min_required = 40  # Reduced minimum requirement
         if len(df) < min_required:
             return self._no_signal("Not enough data")
 
@@ -130,7 +130,7 @@ class MeanReversionStrategy:
             return self._no_signal("BB squeeze detected - skipping mean reversion")
 
         # ── BUY (Oversold Bounce) ─────────────────────────────
-        price_at_lower  = price <= lower * 1.005          # At or below lower band
+        price_at_lower  = price <= lower * 1.015          # Within 1.5% of lower band
         rsi_oversold    = rsi_now < self.rsi_oversold
         stoch_oversold  = k_now < 25
         stoch_k_cross_up = k_prev < d_prev and k_now >= d_now  # %K crosses %D from below
@@ -147,8 +147,8 @@ class MeanReversionStrategy:
         buy_max = 10.0
 
         # ── SELL (Overbought / Mean Target) ───────────────────
-        price_at_upper     = price >= upper * 0.995
-        price_at_mid       = price >= mid * 0.998         # Reached mean target
+        price_at_upper     = price >= upper * 0.985  # Within 1.5% of upper band
+        price_at_mid       = price >= mid * 0.995         # Reached mean target
         rsi_overbought     = rsi_now > self.rsi_overbought
         stoch_overbought   = k_now > 75
         stoch_k_cross_down = k_prev > d_prev and k_now <= d_now
@@ -165,7 +165,7 @@ class MeanReversionStrategy:
         buy_strength  = buy_score  / buy_max
         sell_strength = sell_score / sell_max
 
-        if buy_strength >= 0.55 and buy_strength > sell_strength:
+        if buy_strength >= 0.40 and buy_strength > sell_strength:
             reasons = []
             if price_at_lower:    reasons.append(f"price at Lower BB ({lower:.2f})")
             if rsi_oversold:      reasons.append(f"RSI oversold ({rsi_now:.1f})")
@@ -183,7 +183,7 @@ class MeanReversionStrategy:
                 }
             }
 
-        elif sell_strength >= 0.55 and sell_strength > buy_strength:
+        elif sell_strength >= 0.40 and sell_strength > buy_strength:
             reasons = []
             if price_at_upper:       reasons.append(f"price at Upper BB ({upper:.2f})")
             if price_at_mid:         reasons.append(f"reached mean ({mid:.2f})")
