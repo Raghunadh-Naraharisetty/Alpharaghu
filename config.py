@@ -33,80 +33,47 @@ SCAN_INTERVAL_MINUTES    = int(os.getenv("SCAN_INTERVAL_MINUTES", 15))
 # ── Static Watchlist (used alongside or instead of scanner) ─
 WATCHLIST = [
 
-    # ── Broad Market ETFs (market compass) ─────────────────
-    "SPY",   # S&P 500
-    "QQQ",   # Nasdaq 100
-    "DIA",   # Dow Jones
-    "IWM",   # Russell 2000 small caps
+    # ── Broad Market ETFs ────────────────────────────────────
+    "SPY",   # S&P 500 — market benchmark
+    "QQQ",   # Nasdaq 100 — tech heavy
+    "DIA",   # Dow Jones — blue chips
+    "IWM",   # Russell 2000 — small caps, leads big moves
 
-    # ── Mega Cap Tech (highest news flow) ───────────────────
-    "AAPL",  # Apple
-    "MSFT",  # Microsoft
-    "NVDA",  # NVIDIA — AI chip leader, most volatile
-    "GOOGL", # Alphabet
-    "AMZN",  # Amazon
-    "META",  # Meta
-    "TSLA",  # Tesla
+    # ── Volatility ETFs (new!) ───────────────────────────────
+    "UVXY",  # 1.5x Long VIX — spikes on market fear, great momentum plays
+    "VIXY",  # VIX Short-Term Futures — smoother than UVXY
 
-    # ── Growth Tech (strong movers) ─────────────────────────
-    "AMD",   # AMD — NVIDIA rival
-    "ORCL",  # Oracle — cloud/AI
-    "NFLX",  # Netflix
-    "PLTR",  # Palantir — AI/data, volatile
-    "APP",   # AppLovin — AI ad tech, big mover
-    "ARM",   # ARM Holdings — chip design
-    "CRM",   # Salesforce
-
-    # ── Finance ─────────────────────────────────────────────
-    "JPM",   # JPMorgan
-    "BAC",   # Bank of America
-    "GS",    # Goldman Sachs
-    "V",     # Visa
-    "MA",    # Mastercard
-    "PYPL",  # PayPal
-    "COIN",  # Coinbase — crypto proxy, high volatility
-
-    # ── Healthcare ───────────────────────────────────────────
-    "UNH",   # UnitedHealth
-    "LLY",   # Eli Lilly — weight loss drugs, hot stock
-    "ABBV",  # AbbVie
-    "JNJ",   # Johnson & Johnson
-    "MRK",   # Merck
-    "PFE",   # Pfizer
-
-    # ── Energy ──────────────────────────────────────────────
-    "XOM",   # ExxonMobil
-    "CVX",   # Chevron
-    "OXY",   # Occidental — Buffett holding, volatile
-    "COP",   # ConocoPhillips
-    "SLB",   # Schlumberger
-
-    # ── Consumer ────────────────────────────────────────────
-    "WMT",   # Walmart
-    "COST",  # Costco
-    "HD",    # Home Depot
-    "MCD",   # McDonald's
-    "SBUX",  # Starbucks
-    "TMUS",  # T-Mobile
-
-    # ── Sector ETFs (trade entire sectors) ──────────────────
+    # ── Sector ETFs ──────────────────────────────────────────
     "XLK",   # Technology sector
     "XLF",   # Financial sector
     "XLV",   # Healthcare sector
     "XLE",   # Energy sector
-    "XLY",   # Consumer discretionary
+
+    # ── Tech ─────────────────────────────────────────────────
+    "AAPL",  # Apple
+    "MSFT",  # Microsoft
+    "NVDA",  # NVIDIA — most volatile mega cap
+
+    # ── Finance ──────────────────────────────────────────────
+    "JPM",   # JPMorgan
+    "GS",    # Goldman Sachs
+    "BAC",   # Bank of America
+
+    # ── Healthcare ───────────────────────────────────────────
+    "UNH",   # UnitedHealth
+    "JNJ",   # Johnson & Johnson
+    "PFE",   # Pfizer
+
+    # ── Energy ───────────────────────────────────────────────
+    "XOM",   # ExxonMobil
+    "CVX",   # Chevron
+    "OXY",   # Occidental — volatile, Buffett holding
 
     # ── Commodities via ETFs ─────────────────────────────────
     "GLD",   # Gold
     "SLV",   # Silver
     "USO",   # Oil
     "UNG",   # Natural Gas — highly volatile
-    "PDBC",  # Diversified commodities
-
-    # ── Forex via ETFs ───────────────────────────────────────
-    "UUP",   # US Dollar index
-    "FXE",   # Euro
-    "FXY",   # Japanese Yen
 ]
 
 # ── Strategy Weights (for signal consensus) ─────────────────

@@ -125,16 +125,37 @@ class MeanReversionStrategy:
             "atr":        round(atr_val, 3),
             "vol_ratio":  round(vol_ratio, 2),
         }
+        # (structure indicators added after HH/LL calculation below)
 
         if in_squeeze:
             return self._no_signal("BB squeeze detected - skipping mean reversion")
 
+        # ── HH/LL Market Structure ────────────────────────────
+        # For mean reversion: we WANT to buy dips but NOT in strong downtrends
+        # LL+LH = strong downtrend → oversold could keep falling, skip buy
+        # HH = uptrend → oversold dip is a safe bounce opportunity
+        n = min(len(df), 20)
+        highs = df["high"].iloc[-n:]
+        lows  = df["low"].iloc[-n:]
+
+        recent_high = highs.iloc[-5:].max()
+        prior_high  = highs.iloc[-15:-5].max() if n >= 15 else highs.iloc[:-5].max()
+        recent_low  = lows.iloc[-5:].min()
+        prior_low   = lows.iloc[-15:-5].min()  if n >= 15 else lows.iloc[:-5].min()
+
+        is_higher_high    = recent_high > prior_high
+        is_lower_low      = recent_low  < prior_low
+        is_higher_low     = recent_low  > prior_low
+        is_lower_high     = recent_high < prior_high
+        strong_downtrend  = is_lower_low and is_lower_high   # LL+LH = avoid buying
+        uptrend_dip       = is_higher_high or is_higher_low  # HH or HL = safe to buy dip
+
         # ── BUY (Oversold Bounce) ─────────────────────────────
-        price_at_lower  = price <= lower * 1.015          # Within 1.5% of lower band
-        rsi_oversold    = rsi_now < self.rsi_oversold
-        stoch_oversold  = k_now < 25
-        stoch_k_cross_up = k_prev < d_prev and k_now >= d_now  # %K crosses %D from below
-        rsi_turning_up  = rsi_now > rsi_prev
+        price_at_lower   = price <= lower * 1.015
+        rsi_oversold     = rsi_now < self.rsi_oversold
+        stoch_oversold   = k_now < 25
+        stoch_k_cross_up = k_prev < d_prev and k_now >= d_now
+        rsi_turning_up   = rsi_now > rsi_prev
 
         buy_score = sum([
             price_at_lower   * 3.0,
@@ -143,15 +164,18 @@ class MeanReversionStrategy:
             stoch_k_cross_up * 2.0,
             rsi_turning_up   * 1.0,
             (vol_ratio > 1.3) * 0.5,
+            uptrend_dip      * 1.0,    # Bonus: buying dip in uptrend is safer
+            not strong_downtrend * 0.5, # Bonus: not in strong downtrend
         ])
-        buy_max = 10.0
+        buy_max = 12.0   # Updated max
 
         # ── SELL (Overbought / Mean Target) ───────────────────
-        price_at_upper     = price >= upper * 0.985  # Within 1.5% of upper band
-        price_at_mid       = price >= mid * 0.995         # Reached mean target
+        price_at_upper     = price >= upper * 0.985
+        price_at_mid       = price >= mid * 0.995
         rsi_overbought     = rsi_now > self.rsi_overbought
         stoch_overbought   = k_now > 75
         stoch_k_cross_down = k_prev > d_prev and k_now <= d_now
+        strong_uptrend     = is_higher_high and is_higher_low  # HH+HL = price may keep going up
 
         sell_score = sum([
             price_at_upper     * 3.0,
@@ -159,11 +183,20 @@ class MeanReversionStrategy:
             rsi_overbought     * 2.0,
             stoch_overbought   * 1.5,
             stoch_k_cross_down * 2.0,
+            not strong_uptrend * 0.5,  # Bonus: not in strong uptrend (more likely to reverse)
         ])
-        sell_max = 10.0
+        sell_max = 11.0   # Updated max
 
         buy_strength  = buy_score  / buy_max
         sell_strength = sell_score / sell_max
+
+        # Attach structure to indicators for Telegram display
+        indicators["structure"] = (
+            "HH+HL (uptrend)" if is_higher_high and is_higher_low else
+            "LL+LH (downtrend)" if strong_downtrend else
+            "HH" if is_higher_high else
+            "LL" if is_lower_low else "ranging"
+        )
 
         if buy_strength >= 0.40 and buy_strength > sell_strength:
             reasons = []
