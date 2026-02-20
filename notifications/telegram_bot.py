@@ -28,12 +28,22 @@ class TelegramBot:
     BASE = "https://api.telegram.org/bot{token}/{method}"
 
     def __init__(self):
-        self.token   = config.TELEGRAM_BOT_TOKEN
-        self.chat_id = str(config.TELEGRAM_CHAT_ID)
-        self.enabled = bool(self.token and self.chat_id and
-                           self.token != "your_telegram_bot_token_here")
+        self.token      = config.TELEGRAM_BOT_TOKEN
+        self.chat_id    = str(config.TELEGRAM_CHAT_ID)
+        self.channel_id = str(getattr(config, "TELEGRAM_CHANNEL_ID", ""))
+        self.enabled    = bool(self.token and self.chat_id and
+                              self.token != "your_telegram_bot_token_here")
+        self.channel_enabled = bool(self.enabled and self.channel_id)
         if not self.enabled:
             logger.warning("[TELEGRAM] Not configured - set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env")
+        if self.channel_enabled:
+            logger.info(f"[TELEGRAM] Channel enabled: {self.channel_id}")
+            # Send a test ping to confirm channel is working
+            self.send_to_channel(
+                f"<b>ALPHARAGHU Signals</b> — Bot Online\n"
+                f"<i>Signals will be posted here when detected.</i>\n"
+                f"<i>{datetime.now().strftime('%Y-%m-%d %H:%M ET')}</i>"
+            )
 
     # ── Core send ────────────────────────────────────────────
     def send(self, text: str, parse_mode: str = "HTML") -> bool:
@@ -57,6 +67,33 @@ class TelegramBot:
         except Exception as e:
             logger.error(f"Telegram send failed: {e}")
             return False
+
+    def send_to_channel(self, text: str, parse_mode: str = "HTML") -> bool:
+        """Send a message to the public signals channel only."""
+        if not self.channel_enabled:
+            return False
+        url     = self.BASE.format(token=self.token, method="sendMessage")
+        payload = {
+            "chat_id":                  self.channel_id,
+            "text":                     text,
+            "parse_mode":               parse_mode,
+            "disable_web_page_preview": True,
+        }
+        try:
+            r = requests.post(url, json=payload, timeout=10)
+            if r.status_code == 200:
+                return True
+            else:
+                logger.error(f"Channel send error {r.status_code}: {r.text[:200]}")
+                return False
+        except Exception as e:
+            logger.error(f"Channel send failed: {e}")
+            return False
+
+    def send_both(self, text: str, parse_mode: str = "HTML"):
+        """Send to both private chat AND channel."""
+        self.send(text, parse_mode)
+        self.send_to_channel(text, parse_mode)
 
     # ── Startup message ──────────────────────────────────────
     def send_startup(self, symbol_count: int, watchlist: list) -> bool:
@@ -244,26 +281,65 @@ class TelegramBot:
                 f"Take Profit: <code>${targets.get('target','?')}</code>"
             )
 
-        msg = (
+        # ── Private chat: full detail ─────────────────────────
+        msg_private = (
             f"<b>{direction} — {symbol}</b>\n"
             f"Confidence: {conf:.0%} | {consensus}/3 strategies\n"
             f"{t_text}\n\n"
             f"<b>Breakdown:</b>\n{strat_text}\n\n"
             f"#{symbol.lower()} #{signal.lower()}"
         )
-        return self.send(msg)
+        self.send(msg_private)
+
+        # ── Channel: clean signal card ────────────────────────
+        emoji = "📈" if signal == "BUY" else "📉"
+        msg_channel = (
+            f"{emoji} <b>{signal} — {symbol}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Confidence:  <b>{conf:.0%}</b> | {consensus}/3 strategies\n"
+        )
+        if targets:
+            msg_channel += (
+                f"\n"
+                f"Entry:       <code>${targets.get('entry','?')}</code>\n"
+                f"Stop Loss:   <code>${targets.get('stop','?')}</code>\n"
+                f"Take Profit: <code>${targets.get('target','?')}</code>\n"
+            )
+        msg_channel += (
+            f"\n"
+            f"<i>ALPHARAGHU Signal | {datetime.now().strftime('%H:%M ET')}</i>\n"
+            f"#{symbol.lower()} #{signal.lower()} #alpharaghu"
+        )
+        self.send_to_channel(msg_channel)
+        return True
 
     # ── Order filled ─────────────────────────────────────────
     def send_order_fill(self, symbol: str, side: str, qty: float, price: float) -> bool:
         action = "BOUGHT" if side == "buy" else "SOLD"
-        msg = (
+        emoji  = "✅" if side == "buy" else "🔴"
+
+        # Private chat — detailed
+        msg_private = (
             f"<b>Order Filled — {action} {symbol}</b>\n"
             f"Qty: {qty} shares\n"
             f"Price: <code>${price:.2f}</code>\n"
             f"Total: <code>${qty * price:,.2f}</code>\n"
             f"Time: {datetime.now().strftime('%H:%M:%S')}"
         )
-        return self.send(msg)
+        self.send(msg_private)
+
+        # Channel — clean trade card
+        msg_channel = (
+            f"{emoji} <b>TRADE EXECUTED — {action} {symbol}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Shares: <b>{qty}</b> @ <code>${price:.2f}</code>\n"
+            f"Total:  <code>${qty * price:,.2f}</code>\n"
+            f"\n"
+            f"<i>ALPHARAGHU | {datetime.now().strftime('%H:%M ET')}</i>\n"
+            f"#{symbol.lower()} #{action.lower()} #alpharaghu"
+        )
+        self.send_to_channel(msg_channel)
+        return True
 
     # ── Stopped message ──────────────────────────────────────
     def send_stopped(self, scan_count: int, signal_count: int, account=None) -> bool:

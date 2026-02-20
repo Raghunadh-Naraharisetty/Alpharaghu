@@ -15,6 +15,7 @@ ALPACA_BASE_URL   = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.marke
 # ── Telegram ────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHANNEL_ID   = os.getenv("TELEGRAM_CHANNEL_ID",   "-1003837198055")  # ALPHARAGHU Signals channel
 
 # ── News API ────────────────────────────────────────────────
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
