@@ -54,6 +54,7 @@ WATCHLIST = [
     "AAPL",  # Apple
     "MSFT",  # Microsoft
     "NVDA",  # NVIDIA — most volatile mega cap
+    "SNDK",  # SanDisk — smaller, more volatile tech play
 
     # ── Finance ──────────────────────────────────────────────
     "JPM",   # JPMorgan
