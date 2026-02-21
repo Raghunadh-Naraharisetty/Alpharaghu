@@ -286,6 +286,22 @@ class AlpharaghuEngine:
 
     # ── Execute BUY ───────────────────────────────────────────
     def _execute_buy(self, symbol, price, result):
+
+        # ── Correlation guard: VIX family ─────────────────────
+        # VIXY and UVXY both track VIX — holding both = double exposure
+        # If we already own one VIX ETF, skip buying another
+        VIX_FAMILY = {"VIXY", "UVXY", "VXX", "SVXY"}
+        if symbol in VIX_FAMILY:
+            held_positions = self.alpaca.get_positions()
+            held_symbols   = {p.symbol for p in held_positions}
+            already_vix    = held_symbols & VIX_FAMILY
+            if already_vix:
+                logger.info(
+                    f"  {symbol}: SKIPPED — already holding VIX ETF "
+                    f"{already_vix} (correlation guard)"
+                )
+                return
+
         stop_price   = price * (1 - config.STOP_LOSS_PCT   / 100)
         target_price = price * (1 + config.TAKE_PROFIT_PCT / 100)
         qty          = self.alpaca.calculate_position_size(price, stop_price)

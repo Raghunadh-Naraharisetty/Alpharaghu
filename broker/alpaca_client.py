@@ -105,24 +105,46 @@ class AlpacaClient:
 
         Alpaca rules we must follow:
           1. Bracket orders require WHOLE share quantities (no fractions)
-          2. stop_price must be <= base_price - 0.01  (round DOWN)
-          3. take_profit must be >= base_price + 0.01 (round UP)
+          2. stop_price must be <= base_price - 0.01  (round DOWN using floor)
+          3. take_profit must be >= base_price + 0.01 (round UP using ceil)
+          4. Use GTC (Good Till Cancelled) so stops persist overnight
+          5. Recalculate stop/target from LIVE price at order time, not signal time
         """
         import math
         try:
             order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
 
-            # ── Fix 1: Whole shares for bracket orders ────────
-            # Alpaca rejects fractional qty with bracket/OCO orders
+            # ── Whole shares for bracket orders ───────────────
             whole_qty = max(1, int(qty))   # floor to whole number, minimum 1
 
             if stop_loss and take_profit:
-                # ── Fix 2: Safe stop price (always round DOWN) ─
-                # Must be at least $0.01 below base price
+                # ── FIX: Fetch live mid-price at order submission time ──
+                # stop/target were calculated at signal time but price may have
+                # moved by the time we submit — recalculate from live price
+                live_quote = self.get_latest_quote(symbol)
+                if live_quote and live_quote.get("mid"):
+                    live_price = live_quote["mid"]
+                    # Recalculate stop/target as pct offsets from live price
+                    stop_pct   = abs(stop_loss - 0) / stop_loss if stop_loss else config.STOP_LOSS_PCT / 100
+                    # Derive pct from original signal prices
+                    orig_entry = (stop_loss / (1 - config.STOP_LOSS_PCT / 100))
+                    stop_pct   = config.STOP_LOSS_PCT   / 100
+                    target_pct = config.TAKE_PROFIT_PCT / 100
+                    recalc_stop   = live_price * (1 - stop_pct)
+                    recalc_target = live_price * (1 + target_pct)
+                    logger.info(
+                        f"[PRICE REFRESH] {symbol}: signal=${orig_entry:.2f} "
+                        f"live=${live_price:.2f} → recalc stop/target"
+                    )
+                    stop_loss   = recalc_stop
+                    take_profit = recalc_target
+
+                # ── Safe stop price (always round DOWN) ────────
+                # Guarantees stop is always at least $0.01 below base price
                 safe_stop   = math.floor(stop_loss   * 100) / 100
 
-                # ── Fix 3: Safe target price (always round UP) ─
-                # Must be at least $0.01 above base price
+                # ── Safe target price (always round UP) ─────────
+                # Guarantees target is always at least $0.01 above base price
                 safe_target = math.ceil(take_profit  * 100) / 100
 
                 logger.info(
@@ -130,11 +152,14 @@ class AlpacaClient:
                     f"stop=${safe_stop:.2f} target=${safe_target:.2f}"
                 )
 
+                # ── GTC: stops persist overnight until triggered ─
+                # DAY orders expire at 4 PM — positions unprotected overnight
+                # GTC stays active until price hits stop OR target
                 req = MarketOrderRequest(
                     symbol=symbol,
                     qty=whole_qty,
                     side=order_side,
-                    time_in_force=TimeInForce.DAY,
+                    time_in_force=TimeInForce.GTC,
                     order_class=OrderClass.BRACKET,
                     stop_loss={"stop_price": safe_stop},
                     take_profit={"limit_price": safe_target},
@@ -265,10 +290,22 @@ class AlpacaClient:
             "NFLX","DIS","CMCSA","T","VZ","TMUS",
         ]))
 
+        # Max price filter — stocks above $300 result in < 3 shares per position
+        # which makes position sizing impractical for our $2k max position size
+        MAX_STOCK_PRICE = 300.0
+
         try:
             snapshots = self.get_snapshot(universe)
+            # Filter out stocks too expensive for practical position sizing
+            affordable = {
+                sym: data for sym, data in snapshots.items()
+                if data.get("price", 0) <= MAX_STOCK_PRICE
+            }
+            excluded = [s for s in snapshots if s not in affordable]
+            if excluded:
+                logger.debug(f"[SCANNER] Excluded high-price stocks: {excluded}")
             ranked    = sorted(
-                snapshots.items(),
+                affordable.items(),
                 key=lambda x: (abs(x[1]["change_pct"]), x[1]["daily_volume"]),
                 reverse=True,
             )
