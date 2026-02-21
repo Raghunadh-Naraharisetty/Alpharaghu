@@ -27,6 +27,16 @@ RISK_PER_TRADE_PCT   = float(os.getenv("RISK_PER_TRADE_PCT", 2))
 STOP_LOSS_PCT        = float(os.getenv("STOP_LOSS_PCT", 2))
 TAKE_PROFIT_PCT      = float(os.getenv("TAKE_PROFIT_PCT", 4))
 
+# Position Sizing Method
+# "fixed" = uses STOP_LOSS_PCT as fixed % stop (simple, predictable)
+# "atr"   = uses ATR x multiplier as dynamic stop (adapts to real volatility)
+#   High-volatility stock (UVXY) -> smaller position
+#   Low-volatility stock  (JNJ)  -> larger position
+#   Both risk the SAME dollar amount per trade
+POSITION_SIZE_METHOD  = os.getenv("POSITION_SIZE_METHOD",  "atr")
+ATR_STOP_MULTIPLIER   = float(os.getenv("ATR_STOP_MULTIPLIER",   2.0))  # stop   = price - (ATR x 2.0)
+ATR_TARGET_MULTIPLIER = float(os.getenv("ATR_TARGET_MULTIPLIER", 4.0))  # target = price + (ATR x 4.0) = 2:1 R:R
+
 # ── Scanner Settings ────────────────────────────────────────
 USE_DYNAMIC_SCANNER      = os.getenv("USE_DYNAMIC_SCANNER", "true").lower() == "true"
 SCAN_INTERVAL_MINUTES    = int(os.getenv("SCAN_INTERVAL_MINUTES", 15))
@@ -54,7 +64,6 @@ WATCHLIST = [
     "AAPL",  # Apple
     "MSFT",  # Microsoft
     "NVDA",  # NVIDIA — most volatile mega cap
-    "SNDK",  # SanDisk — smaller, more volatile tech play
 
     # ── Finance ──────────────────────────────────────────────
     "JPM",   # JPMorgan

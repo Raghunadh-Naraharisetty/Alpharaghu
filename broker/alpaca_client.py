@@ -315,14 +315,91 @@ class AlpacaClient:
             return config.WATCHLIST[:top_n]
 
     # ── Position Sizing ─────────────────────────────────────
-    def calculate_position_size(self, price: float, stop_price: float) -> float:
+    def get_atr(self, symbol: str, period: int = 14) -> float:
         """
-        Risk-based position sizing: risk 2% of portfolio per trade.
-        Returns float — caller must convert to int for bracket orders.
-        Minimum 1 whole share required for bracket orders.
+        Calculate Average True Range (ATR) for a symbol.
+        ATR measures real volatility — how much a stock moves per bar on average.
+        Used by ATR position sizing to adapt stop distance to actual market conditions.
         """
-        portfolio      = self.get_portfolio_value()
-        risk_amount    = portfolio * (config.RISK_PER_TRADE_PCT / 100)
+        try:
+            df = self.get_bars(symbol, timeframe="1Day", limit=period + 5)
+            if df.empty or len(df) < period:
+                return 0.0
+            high  = df["high"]
+            low   = df["low"]
+            close = df["close"]
+            # True Range = max of: (H-L), |H-prev_C|, |L-prev_C|
+            prev_close = close.shift(1)
+            tr = pd.concat([
+                high - low,
+                (high - prev_close).abs(),
+                (low  - prev_close).abs(),
+            ], axis=1).max(axis=1)
+            atr = tr.rolling(period).mean().iloc[-1]
+            return float(atr) if not pd.isna(atr) else 0.0
+        except Exception as e:
+            logger.error(f"ATR calculation error for {symbol}: {e}")
+            return 0.0
+
+    def calculate_position_size(self, price: float, stop_price: float,
+                                 symbol: str = None) -> float:
+        """
+        Risk-based position sizing — two modes controlled by config.POSITION_SIZE_METHOD:
+
+        "fixed" (original):
+            Stop = fixed % below entry (STOP_LOSS_PCT)
+            Simple, predictable, same % stop for every stock
+
+        "atr" (new — adapted from friend's bot):
+            Stop = entry - (ATR × ATR_STOP_MULTIPLIER)
+            Target = entry + (ATR × ATR_TARGET_MULTIPLIER)
+            Adapts to real volatility — high-vol stocks get smaller
+            positions, low-vol stocks get larger, both risk the same $
+
+        Both methods:
+            - Risk exactly RISK_PER_TRADE_PCT % of portfolio per trade
+            - Cap at MAX_POSITION_SIZE dollars
+            - Minimum 1 whole share (Alpaca bracket order requirement)
+        """
+        portfolio   = self.get_portfolio_value()
+        risk_amount = portfolio * (config.RISK_PER_TRADE_PCT / 100)
+
+        method = getattr(config, "POSITION_SIZE_METHOD", "fixed").lower()
+
+        if method == "atr" and symbol:
+            # ── ATR Method ─────────────────────────────────────
+            atr = self.get_atr(symbol)
+            if atr > 0:
+                stop_multiplier   = getattr(config, "ATR_STOP_MULTIPLIER",   2.0)
+                target_multiplier = getattr(config, "ATR_TARGET_MULTIPLIER", 4.0)
+                atr_stop_dist     = atr * stop_multiplier
+                atr_stop_price    = price - atr_stop_dist
+                atr_target_price  = price + (atr * target_multiplier)
+                risk_per_share    = atr_stop_dist
+
+                atr_pct = (atr / price) * 100
+                logger.info(
+                    f"[SIZE-ATR] {symbol}: ATR=${atr:.2f} ({atr_pct:.1f}%) | "
+                    f"stop=${atr_stop_price:.2f} target=${atr_target_price:.2f}"
+                )
+                # Return as tuple so caller can use ATR-based stop/target
+                # if caller only wants qty, the atr_stop/target are logged
+                qty = risk_amount / risk_per_share
+                max_qty = config.MAX_POSITION_SIZE / price
+                final = min(qty, max_qty)
+                if final < 1.0:
+                    logger.info(f"[SIZE-ATR] Qty {final:.2f} < 1 share — using 1 minimum")
+                    return 1.0
+                logger.info(
+                    f"[SIZE-ATR] {symbol}: qty={final:.1f} | "
+                    f"risk=${risk_amount:.0f} / ${risk_per_share:.2f}/share"
+                )
+                return round(final, 2)
+            else:
+                logger.warning(f"[SIZE-ATR] {symbol}: ATR=0, falling back to fixed sizing")
+                # Fall through to fixed method below
+
+        # ── Fixed Method (default / fallback) ──────────────────
         risk_per_share = abs(price - stop_price)
         if risk_per_share < 0.01:
             logger.warning(f"[SIZE] Stop too close to price (${risk_per_share:.4f}) — skipping")
@@ -330,10 +407,13 @@ class AlpacaClient:
         qty     = risk_amount / risk_per_share
         max_qty = config.MAX_POSITION_SIZE / price
         final   = min(qty, max_qty)
-        # Ensure at least 1 whole share (bracket orders require whole shares)
         if final < 1.0:
             logger.info(f"[SIZE] Qty {final:.2f} < 1 share — using 1 share minimum")
             return 1.0
+        logger.info(
+            f"[SIZE-FIXED] qty={final:.1f} | "
+            f"risk=${risk_amount:.0f} / ${risk_per_share:.2f}/share"
+        )
         return round(final, 2)
 
     # ── Market Status ────────────────────────────────────────

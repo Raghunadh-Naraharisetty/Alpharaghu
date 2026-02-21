@@ -304,7 +304,22 @@ class AlpharaghuEngine:
 
         stop_price   = price * (1 - config.STOP_LOSS_PCT   / 100)
         target_price = price * (1 + config.TAKE_PROFIT_PCT / 100)
-        qty          = self.alpaca.calculate_position_size(price, stop_price)
+        qty          = self.alpaca.calculate_position_size(price, stop_price, symbol=symbol)
+
+        if qty < 0.01:
+            logger.warning(f"  {symbol}: position size too small")
+            return
+
+        # If ATR method, fetch ATR-based stop/target for better accuracy
+        if getattr(config, "POSITION_SIZE_METHOD", "fixed").lower() == "atr":
+            atr = self.alpaca.get_atr(symbol)
+            if atr > 0:
+                atr_stop   = price - (atr * getattr(config, "ATR_STOP_MULTIPLIER",   2.0))
+                atr_target = price + (atr * getattr(config, "ATR_TARGET_MULTIPLIER", 4.0))
+                # Only use ATR prices if they're sane (stop below price, target above)
+                if atr_stop < price and atr_target > price:
+                    stop_price   = atr_stop
+                    target_price = atr_target
 
         if qty < 0.01:
             logger.warning(f"  {symbol}: position size too small")
