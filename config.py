@@ -39,6 +39,12 @@ ATR_TARGET_MULTIPLIER = float(os.getenv("ATR_TARGET_MULTIPLIER", 4.0))  # target
 
 # ── Scanner Settings ────────────────────────────────────────
 USE_DYNAMIC_SCANNER      = os.getenv("USE_DYNAMIC_SCANNER", "true").lower() == "true"
+
+# Pivot-level stops (S1/S2 as stop, R1 as target) — more precise than fixed %
+USE_PIVOT_STOPS          = os.getenv("USE_PIVOT_STOPS", "true").lower() == "true"
+
+# Pre-market gapper mode — minimum gap % to qualify as a tradeable gapper
+PREMARKET_MIN_GAP_PCT    = float(os.getenv("PREMARKET_MIN_GAP_PCT", 5.0))
 SCAN_INTERVAL_MINUTES    = int(os.getenv("SCAN_INTERVAL_MINUTES", 15))
 
 # ── Static Watchlist (used alongside or instead of scanner) ─

@@ -69,7 +69,7 @@ class MomentumStrategy:
         return prices.ewm(span=period, adjust=False).mean()
 
     # ── Signal Generation ────────────────────────────────────
-    def generate_signal(self, df: pd.DataFrame) -> dict:
+    def generate_signal(self, df: pd.DataFrame, vwap: float = 0.0) -> dict:
         """
         Returns dict: {
           signal: 'BUY' | 'SELL' | 'HOLD',
@@ -133,6 +133,12 @@ class MomentumStrategy:
         else:
             structure = "RANGING"    # Choppy — avoid new entries
 
+        # ── VWAP Confirmation ─────────────────────────────────
+        # VWAP = intraday 'fair price' — institutions buy above, sell below
+        # If vwap was passed in, use it; otherwise treat as neutral
+        above_vwap = (vwap > 0 and latest_close > vwap)
+        vwap_str   = f"${vwap:.2f}" if vwap > 0 else "N/A"
+
         indicators = {
             "rsi":       round(latest_rsi, 2),
             "macd":      round(latest_macd, 4),
@@ -140,6 +146,8 @@ class MomentumStrategy:
             "ema200":    round(latest_ema200, 2),
             "ema50":     round(latest_ema50, 2),
             "price":     round(latest_close, 2),
+            "vwap":      round(vwap, 2) if vwap > 0 else None,
+            "above_vwap": above_vwap,
             "vol_ratio": round(latest_vol / avg_vol_val, 2) if avg_vol_val else 0,
             "structure": structure,
             "hh": is_higher_high, "hl": is_higher_low,
@@ -169,8 +177,9 @@ class MomentumStrategy:
             structure_bullish  * 1.5,   # HH = uptrend confirmed
             structure_strong   * 0.5,   # HH+HL = strongest signal bonus
             not structure_ranging * 0.0, # Ranging = no bonus (not penalized)
+            above_vwap         * 0.5,   # Above VWAP = institutional support
         ])
-        buy_max = 9.5   # Updated max with structure scores
+        buy_max = 10.0  # Updated max with VWAP score
 
         # ── SELL Conditions ───────────────────────────────────
         below_ema200    = latest_close < latest_ema200
@@ -202,6 +211,7 @@ class MomentumStrategy:
             if rsi_cross_up:       reasons.append(f"RSI crossed 50 ({latest_rsi:.1f})")
             if macd_cross_up:      reasons.append("MACD bullish crossover")
             if volume_confirmed:   reasons.append(f"vol {indicators['vol_ratio']}x avg")
+            if above_vwap:         reasons.append(f"above VWAP ({vwap_str})")
             if structure_strong:   reasons.append(f"structure: HH+HL (strong uptrend)")
             elif structure_bullish: reasons.append(f"structure: HH (new highs)")
             elif structure_ranging: reasons.append("structure: ranging (weak)")

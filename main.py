@@ -116,6 +116,24 @@ class AlpharaghuEngine:
 
     # ── Symbol universe ───────────────────────────────────────
     def get_symbols(self):
+        from zoneinfo import ZoneInfo
+        ET = ZoneInfo("America/New_York")
+        now = datetime.now(ET)
+        h, m = now.hour, now.minute
+
+        # Pre-market mode: 4:00 AM – 9:29 AM ET
+        is_premarket = (4 <= h < 9) or (h == 9 and m < 30)
+        if is_premarket:
+            logger.info("[PRE-MARKET] Scanning for gappers (4:00 AM – 9:30 AM mode)")
+            gappers = self.alpaca.get_premarket_gappers(
+                min_gap_pct=getattr(config, "PREMARKET_MIN_GAP_PCT", 5.0),
+                top_n=15
+            )
+            # Merge gappers with watchlist — gappers get priority at front
+            combined = list(dict.fromkeys(gappers + list(config.WATCHLIST)))
+            return combined[:40]
+
+        # Regular market hours
         symbols = list(config.WATCHLIST)
         if config.USE_DYNAMIC_SCANNER:
             symbols = list(set(symbols + self.alpaca.get_top_movers(top_n=15)))
@@ -230,7 +248,7 @@ class AlpharaghuEngine:
             return None
 
         news   = self.news.get_all_news(symbol)
-        result = self.combiner.run(symbol, df_15, df_day, news)
+        result = self.combiner.run(symbol, df_15, df_day, news, alpaca_client=self.alpaca)
 
         signal = result["signal"]
         conf   = result["confidence"]
@@ -304,26 +322,51 @@ class AlpharaghuEngine:
 
         stop_price   = price * (1 - config.STOP_LOSS_PCT   / 100)
         target_price = price * (1 + config.TAKE_PROFIT_PCT / 100)
-        qty          = self.alpaca.calculate_position_size(price, stop_price, symbol=symbol)
+        stop_method  = "fixed_%"
 
-        if qty < 0.01:
-            logger.warning(f"  {symbol}: position size too small")
-            return
-
-        # If ATR method, fetch ATR-based stop/target for better accuracy
+        # ── Priority 1: ATR-based stop/target (adapts to volatility) ─
         if getattr(config, "POSITION_SIZE_METHOD", "fixed").lower() == "atr":
             atr = self.alpaca.get_atr(symbol)
             if atr > 0:
                 atr_stop   = price - (atr * getattr(config, "ATR_STOP_MULTIPLIER",   2.0))
                 atr_target = price + (atr * getattr(config, "ATR_TARGET_MULTIPLIER", 4.0))
-                # Only use ATR prices if they're sane (stop below price, target above)
                 if atr_stop < price and atr_target > price:
                     stop_price   = atr_stop
                     target_price = atr_target
+                    stop_method  = f"ATR×{getattr(config,'ATR_STOP_MULTIPLIER',2.0)}"
 
-        if qty < 0.01:
-            logger.warning(f"  {symbol}: position size too small")
-            return
+        # ── Priority 2: Pivot-level refinement (institutional levels) ─
+        # Use S1 as stop if it's between ATR-stop and price (tighter = better)
+        # Use R1 as target if it's above price (real resistance = real target)
+        if getattr(config, "USE_PIVOT_STOPS", True):
+            pivots = self.alpaca.get_pivot_levels(symbol)
+            if pivots:
+                s1 = pivots.get("S1", 0)
+                r1 = pivots.get("R1", 0)
+                s2 = pivots.get("S2", 0)
+
+                # Use S1 as stop if it's below price but tighter than our current stop
+                # Tighter stop = less risk, same signal quality
+                if s1 > 0 and s1 < price and s1 > stop_price:
+                    stop_price  = s1
+                    stop_method = f"Pivot S1 (${s1:.2f})"
+
+                # Use S2 as fallback stop if S1 is above stop_price but too close to price
+                elif s2 > 0 and s2 < price and s2 > stop_price:
+                    stop_price  = s2
+                    stop_method = f"Pivot S2 (${s2:.2f})"
+
+                # Use R1 as target if it's above our current target
+                if r1 > 0 and r1 > price:
+                    target_price = r1
+                    logger.info(f"  {symbol}: Pivot R1=${r1:.2f} as take-profit target")
+
+                logger.info(
+                    f"  {symbol}: Stop={stop_method} ${stop_price:.2f} | "
+                    f"Target=${target_price:.2f} | Pivots={pivots}"
+                )
+
+        qty = self.alpaca.calculate_position_size(price, stop_price, symbol=symbol)
 
         order = self.alpaca.place_market_order(
             symbol=symbol, qty=qty, side="buy",
@@ -380,6 +423,95 @@ class AlpharaghuEngine:
         except Exception as e:
             logger.error(f"Daily summary error: {e}")
 
+
+    # ── Morning Market Briefing ───────────────────────────────
+    def send_morning_briefing(self):
+        """
+        Sends an AI-generated market briefing at 9:00 AM ET.
+        Covers: VIX level, SPY trend, key levels to watch, macro events.
+        Uses current bar data from Alpaca — no external API needed.
+        """
+        try:
+            from zoneinfo import ZoneInfo
+            ET = ZoneInfo("America/New_York")
+            now_et = datetime.now(ET)
+
+            # Gather live market data
+            spy_bars = self.alpaca.get_bars("SPY", "1Day", limit=21)
+            vix_bars = self.alpaca.get_bars("VIXY", "1Day", limit=5)  # VIXY as VIX proxy
+
+            if spy_bars.empty:
+                logger.warning("Morning briefing: no SPY data")
+                return
+
+            spy_price   = float(spy_bars["close"].iloc[-1])
+            spy_prev    = float(spy_bars["close"].iloc[-2])
+            spy_change  = (spy_price - spy_prev) / spy_prev * 100
+            spy_sma20   = float(spy_bars["close"].rolling(20).mean().iloc[-1])
+            spy_sma50   = float(spy_bars["close"].rolling(min(50, len(spy_bars))).mean().iloc[-1])
+
+            # VIX proxy via VIXY
+            vixy_price  = float(vix_bars["close"].iloc[-1]) if not vix_bars.empty else 0
+            vixy_prev   = float(vix_bars["close"].iloc[-2]) if len(vix_bars) >= 2 else vixy_price
+            vixy_change = (vixy_price - vixy_prev) / vixy_prev * 100 if vixy_prev else 0
+
+            # Determine market regime
+            if spy_price > spy_sma20 > spy_sma50:
+                regime = "🟢 BULLISH — Price > SMA20 > SMA50"
+            elif spy_price < spy_sma20 < spy_sma50:
+                regime = "🔴 BEARISH — Price < SMA20 < SMA50"
+            else:
+                regime = "🟡 MIXED — Transitional market"
+
+            # VIX reading interpretation
+            if vixy_price < 20:
+                vix_read = "Low fear — complacent market"
+            elif vixy_price < 30:
+                vix_read = "Moderate volatility — normal conditions"
+            elif vixy_price < 40:
+                vix_read = "Elevated fear — tread carefully"
+            else:
+                vix_read = "EXTREME FEAR — high-volatility regime"
+
+            # SPY pivot levels for the day
+            spy_pivots = self.alpaca.get_pivot_levels("SPY")
+            pivot_str = ""
+            if spy_pivots:
+                pivot_str = (
+                    f"\n📐 <b>SPY Key Levels Today:</b>"
+                    f"\n  R2: ${spy_pivots.get('R2', 0):.2f}  |  R1: ${spy_pivots.get('R1', 0):.2f}"
+                    f"\n  Pivot: ${spy_pivots.get('pivot', 0):.2f}"
+                    f"\n  S1: ${spy_pivots.get('S1', 0):.2f}  |  S2: ${spy_pivots.get('S2', 0):.2f}"
+                )
+
+            # Open positions snapshot
+            positions = self.alpaca.get_positions()
+            pos_str = ""
+            if positions:
+                total_pl = sum(float(p.unrealized_pl) for p in positions)
+                pos_str  = f"\n💼 <b>Open Positions:</b> {len(positions)} | Unrealized P&amp;L: ${total_pl:+.2f}"
+
+            msg = (
+                f"🌅 <b>ALPHARAGHU — Morning Briefing</b>"
+                f"\n{now_et.strftime('%A %b %d, %Y — %I:%M %p ET')}"
+                f"\n{'─' * 32}"
+                f"\n\n📊 <b>SPY:</b> ${spy_price:.2f} ({spy_change:+.2f}%)"
+                f"\n   SMA20: ${spy_sma20:.2f}  |  SMA50: ${spy_sma50:.2f}"
+                f"\n   {regime}"
+                f"\n\n😰 <b>VIXY (Fear):</b> ${vixy_price:.2f} ({vixy_change:+.2f}%)"
+                f"\n   {vix_read}"
+                f"{pivot_str}"
+                f"{pos_str}"
+                f"\n\n⚡ <b>Strategy:</b> Scanning {len(config.WATCHLIST)} symbols every "
+                f"{config.SCAN_INTERVAL_MINUTES} min"
+                f"\n🤖 Bot is armed and scanning. Good luck!"
+            )
+
+            self.telegram.send_both(msg)
+            logger.info("Morning briefing sent to Telegram")
+        except Exception as e:
+            logger.error(f"Morning briefing error: {e}")
+
     # ── Main loop ─────────────────────────────────────────────
     def run(self):
         logger.info("Engine starting...")
@@ -396,6 +528,7 @@ class AlpharaghuEngine:
                            f"P&L: ${float(p.unrealized_pl):+.2f}")
 
         schedule.every(config.SCAN_INTERVAL_MINUTES).minutes.do(self.run_scan)
+        schedule.every().day.at("09:00").do(self.send_morning_briefing)  # AM briefing
         schedule.every().day.at("09:31").do(self.risk.reset_daily)
         schedule.every().day.at("16:05").do(self.send_daily_summary)
 

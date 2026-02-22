@@ -34,17 +34,28 @@ class StrategyCombiner:
         import config
         self.weights = config.STRATEGY_WEIGHTS
 
-    def run(self, symbol: str, df_15min, df_daily, news_articles: list = None) -> dict:
+    def run(self, symbol: str, df_15min, df_daily, news_articles: list = None, alpaca_client=None) -> dict:
         results = {}
+        self._alpaca_client = alpaca_client
 
         # ── Run each strategy ────────────────────────────────
+        # Fetch VWAP once and pass to momentum strategy for confirmation
+        vwap = 0.0
+        if hasattr(self, "_alpaca_client") and self._alpaca_client:
+            try:
+                vwap = self._alpaca_client.get_vwap(symbol)
+            except Exception:
+                vwap = 0.0
+
         for name, strat, extra_kwargs in [
-            ("momentum",       self.strat1, {}),
+            ("momentum",       self.strat1, {"vwap": vwap}),
             ("mean_reversion", self.strat2, {}),
             ("news_sentiment", self.strat3, {"symbol": symbol, "news_articles": news_articles}),
         ]:
             try:
                 if name == "news_sentiment":
+                    results[name] = strat.generate_signal(df_15min, **extra_kwargs)
+                elif name == "momentum":
                     results[name] = strat.generate_signal(df_15min, **extra_kwargs)
                 else:
                     results[name] = strat.generate_signal(df_15min)

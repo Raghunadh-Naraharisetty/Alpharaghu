@@ -309,7 +309,17 @@ class AlpacaClient:
                 key=lambda x: (abs(x[1]["change_pct"]), x[1]["daily_volume"]),
                 reverse=True,
             )
-            return [sym for sym, _ in ranked[:top_n]]
+            # Apply quality filter — skip structurally broken stocks
+            quality_symbols = []
+            for sym, _ in ranked:
+                if len(quality_symbols) >= top_n:
+                    break
+                ok, reason = self.is_quality_stock(sym)
+                if ok:
+                    quality_symbols.append(sym)
+                else:
+                    logger.info(f"[SCANNER] Quality filter skipped {sym}: {reason}")
+            return quality_symbols
         except Exception as e:
             logger.error(f"Scanner error: {e}")
             return config.WATCHLIST[:top_n]
@@ -415,6 +425,134 @@ class AlpacaClient:
             f"risk=${risk_amount:.0f} / ${risk_per_share:.2f}/share"
         )
         return round(final, 2)
+
+
+    # ── VWAP ─────────────────────────────────────────────────
+    def get_vwap(self, symbol: str) -> float:
+        """
+        Calculate today's VWAP (Volume Weighted Average Price).
+        Price above VWAP = bullish institutional flow.
+        Price below VWAP = bearish / distribution.
+        """
+        try:
+            df = self.get_bars(symbol, timeframe="15Min", limit=26)
+            if df.empty or len(df) < 2:
+                return 0.0
+            typical_price = (df["high"] + df["low"] + df["close"]) / 3
+            vwap = (typical_price * df["volume"]).cumsum() / df["volume"].cumsum()
+            return float(vwap.iloc[-1])
+        except Exception as e:
+            logger.error(f"VWAP error for {symbol}: {e}")
+            return 0.0
+
+    # ── Pivot Levels ──────────────────────────────────────────
+    def get_pivot_levels(self, symbol: str) -> dict:
+        """
+        Classic Pivot Points from yesterday's daily bar.
+        Institutional desks set orders at R1/R2/S1/S2 every day.
+        P = (H+L+C)/3  |  R1=2P-L  |  R2=P+(H-L)  |  S1=2P-H  |  S2=P-(H-L)
+        """
+        try:
+            df = self.get_bars(symbol, timeframe="1Day", limit=3)
+            if df.empty or len(df) < 2:
+                return {}
+            prev = df.iloc[-2]
+            H, L, C = float(prev["high"]), float(prev["low"]), float(prev["close"])
+            P  = (H + L + C) / 3
+            R1 = 2*P - L;  R2 = P + (H - L);  R3 = H + 2*(P - L)
+            S1 = 2*P - H;  S2 = P - (H - L);  S3 = L - 2*(H - P)
+            return {
+                "pivot": round(P, 2),
+                "R1": round(R1, 2), "R2": round(R2, 2), "R3": round(R3, 2),
+                "S1": round(S1, 2), "S2": round(S2, 2), "S3": round(S3, 2),
+            }
+        except Exception as e:
+            logger.error(f"Pivot error for {symbol}: {e}")
+            return {}
+
+    # ── Historical Quality Filter ─────────────────────────────
+    def is_quality_stock(self, symbol: str) -> tuple:
+        """
+        Filters out structurally broken stocks before trading.
+        Prevents bot from chasing zombie stocks in top-movers list.
+
+        PASS: price > SMA200  (healthy long-term trend)
+        SKIP: 1Y loss > 70%
+        SKIP: 5Y loss > 80% AND still not recovering
+        """
+        try:
+            df_daily = self.get_bars(symbol, timeframe="1Day", limit=260)
+            if df_daily.empty or len(df_daily) < 30:
+                return True, "insufficient history — assuming OK"
+
+            current_price = float(df_daily["close"].iloc[-1])
+
+            # Fast pass: above SMA200 = healthy long-term trend
+            if len(df_daily) >= 200:
+                sma200 = df_daily["close"].rolling(200).mean().iloc[-1]
+                if current_price > sma200:
+                    return True, f"above SMA200 (${sma200:.2f})"
+
+            change_1y = None
+            if len(df_daily) >= 252:
+                price_1y_ago = float(df_daily["close"].iloc[-252])
+                change_1y = (current_price - price_1y_ago) / price_1y_ago * 100
+                if change_1y < -70:
+                    return False, f"1Y loss {change_1y:.1f}% (< -70%)"
+
+            if len(df_daily) >= 260:
+                price_old = float(df_daily["close"].iloc[0])
+                change_5y = (current_price - price_old) / price_old * 100
+                trending_up = change_1y is not None and change_1y > 0
+                if change_5y < -80 and not trending_up:
+                    return False, f"5Y loss {change_5y:.1f}% + 1Y not recovering"
+
+            return True, "passes quality check"
+        except Exception as e:
+            logger.error(f"Quality check error for {symbol}: {e}")
+            return True, "error — assuming OK"
+
+    # ── Pre-Market Gappers ────────────────────────────────────
+    def get_premarket_gappers(self, min_gap_pct: float = 5.0, top_n: int = 15) -> list:
+        """
+        Finds stocks gapping up significantly before 9:30 AM ET.
+        These are the strongest momentum setups of the day.
+        Returns symbols sorted by gap % descending.
+        """
+        try:
+            import config as _cfg
+            base_universe = list(getattr(_cfg, "WATCHLIST", []))
+        except Exception:
+            base_universe = []
+
+        universe = list(set(base_universe + [
+            "AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA","AMD","INTC","ORCL",
+            "JPM","BAC","GS","WFC","MS","C",
+            "JNJ","PFE","ABBV","MRK","UNH",
+            "XOM","CVX","COP","SLB","OXY",
+            "WMT","COST","HD","LOW","SPY","QQQ","IWM","DIA",
+            "NFLX","DIS","CMCSA","TMUS","GLD","SLV","USO",
+        ]))
+
+        try:
+            snapshots = self.get_snapshot(universe)
+            gappers = [
+                (sym, data.get("change_pct", 0))
+                for sym, data in snapshots.items()
+                if data.get("price", 0) >= 1.0
+                and data.get("change_pct", 0) >= min_gap_pct
+            ]
+            gappers.sort(key=lambda x: x[1], reverse=True)
+            result = [s for s, _ in gappers[:top_n]]
+            if result:
+                logger.info(
+                    f"[PRE-MARKET] {len(result)} gappers (>{min_gap_pct}%): "
+                    f"{[(s, f'{c:.1f}%') for s,c in gappers[:5]]}"
+                )
+            return result
+        except Exception as e:
+            logger.error(f"Pre-market gapper scan error: {e}")
+            return []
 
     # ── Market Status ────────────────────────────────────────
     def is_market_open(self) -> bool:
