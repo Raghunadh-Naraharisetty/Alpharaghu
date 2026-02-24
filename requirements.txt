@@ -1,11 +1,24 @@
-# ALPHARAGHU - Requirements (Windows Compatible)
+# ALPHARAGHU - Requirements
+# Install: pip install -r requirements.txt
+
+# ── Core broker & data ───────────────────────────────────────
 alpaca-py>=0.13.0
 pandas>=2.0.0
 numpy>=1.24.0
+yfinance>=0.2.40
+requests>=2.31.0
+httpx>=0.27.0
+python-dotenv>=1.0.0
 schedule>=1.2.0
 aiohttp>=3.9.0
-requests>=2.31.0
-yfinance>=0.2.40
-python-dotenv>=1.0.0
+
+# ── Dashboard ────────────────────────────────────────────────
 streamlit>=1.32.0
-httpx>=0.27.0
+plotly>=5.18.0         # Interactive charts — equity curve, drawdown, P&L heatmap
+
+# ── Terminal output ──────────────────────────────────────────
+loguru>=0.7.0          # Log rotation (daily files, 30-day retention)
+rich>=13.7.0           # Color-coded terminal output
+
+# ── Technical indicators ─────────────────────────────────────
+pandas-ta>=0.3.14b     # 130+ indicators — ADX, Supertrend, StochRSI, CMF

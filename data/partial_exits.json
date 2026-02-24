@@ -1,0 +1,35 @@
+{
+  "positions": {
+    "APA": {
+      "entry": 29.055,
+      "qty_original": 68.83,
+      "qty_remaining": 68.83,
+      "atr": 1.1936,
+      "partial_target": 32.64,
+      "partial_filled": false,
+      "trailing_stop": null,
+      "registered_at": "2026-02-24T09:51:49.771329"
+    },
+    "SO": {
+      "entry": 94.74,
+      "qty_original": 21.11,
+      "qty_remaining": 21.11,
+      "atr": 2.176,
+      "partial_target": 101.27,
+      "partial_filled": false,
+      "trailing_stop": null,
+      "registered_at": "2026-02-24T11:36:19.766153"
+    },
+    "GLD": {
+      "entry": 474.0,
+      "qty_original": 4.22,
+      "qty_remaining": 4.22,
+      "atr": 13.8404,
+      "partial_target": 515.52,
+      "partial_filled": false,
+      "trailing_stop": null,
+      "registered_at": "2026-02-24T12:39:27.482968"
+    }
+  },
+  "saved_at": "2026-02-24T12:39:27.483400"
+}

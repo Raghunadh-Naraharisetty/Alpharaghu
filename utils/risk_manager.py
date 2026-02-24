@@ -61,14 +61,14 @@ class RiskManager:
         This prevents getting whipped out by opening volatility before
         a proper intraday trend has established itself.
         """
-        from datetime import time as dtime
-        now_et = datetime.now()   # Assumes server runs in ET or adjust as needed
-        market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        from datetime import time as dtime, timedelta
+        now_et        = datetime.now()
         suppress_mins = getattr(config, "TRAIL_SUPPRESS_OPEN_MINUTES", 30)
+        open_dt       = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        suppress_end  = open_dt + timedelta(minutes=suppress_mins)
         in_morning_window = (
             now_et.weekday() < 5 and   # Mon-Fri only
-            dtime(9, 30) <= now_et.time() <=
-            (now_et.replace(hour=9, minute=30 + suppress_mins)).time()
+            dtime(9, 30) <= now_et.time() <= suppress_end.time()
         )
         if in_morning_window:
             regular_stop = entry_price * (1 - getattr(config, "STOP_LOSS_PCT", 2.0) / 100)

@@ -278,38 +278,144 @@ class AlpacaClient:
             return {}
 
     # ── Market Scanner ──────────────────────────────────────
-    def get_top_movers(self, top_n: int = 20) -> list:
-        """Scan a liquid universe and return top N movers by % change + volume"""
-        universe = list(set([
-            "AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA","AMD","INTC","ORCL",
-            "JPM","BAC","GS","WFC","MS","C","V","MA","PYPL","SQ",
-            "JNJ","PFE","ABBV","MRK","UNH","CVS","AMGN",
-            "XOM","CVX","COP","SLB","OXY",
-            "WMT","TGT","COST","HD","LOW",
-            "GLD","SLV","USO","UUP","FXE","SPY","QQQ","IWM","DIA",
-            "NFLX","DIS","CMCSA","T","VZ","TMUS",
-        ]))
+    # ── Full sector-stock universe ─────────────────────────────
+    # Maps each sector ETF to its major tradeable stocks.
+    # Used by BOTH the sector rotation filter AND the sector-aware scanner.
+    SECTOR_UNIVERSE = {
+        "XLK": [   # Technology
+            "AAPL","MSFT","NVDA","AMD","INTC","ORCL","CRM","ADBE","CSCO","QCOM",
+            "MU","AVGO","TXN","MRVL","LRCX","AMAT","KLAC","SNPS","CDNS","ANSS",
+            "NFLX","META","GOOGL","UBER","LYFT","DDOG","CRWD","NET","ZS","SNOW",
+        ],
+        "XLF": [   # Financials
+            "JPM","BAC","GS","MS","WFC","C","V","MA","AXP","BLK",
+            "SCHW","USB","PNC","TFC","COF","PYPL","SQ","COIN","SOFI","HOOD",
+        ],
+        "XLV": [   # Healthcare
+            "UNH","JNJ","PFE","ABBV","MRK","CVS","MRNA","BMY","AMGN","GILD",
+            "TMO","DHR","MDT","SYK","BSX","ISRG","ZBH","BAX","HCA","CNC",
+        ],
+        "XLE": [   # Energy
+            "XOM","CVX","COP","SLB","OXY","MPC","VLO","PSX","HAL","BKR",
+            "DVN","APA","FANG","EOG","PXD",
+        ],
+        "XLY": [   # Consumer Discretionary
+            "AMZN","TSLA","HD","LOW","NKE","SBUX","MCD","DIS","BKNG","MAR",
+            "TGT","COST","WMT","DG","DLTR","BBY","ETSY",
+        ],
+        "XLI": [   # Industrials
+            "GE","HON","CAT","BA","UPS","RTX","DE","FDX","LMT","NOC",
+            "MMM","EMR","ETN","ROK","XYL",
+        ],
+        "XLP": [   # Consumer Staples
+            "WMT","COST","PG","KO","PEP","MDLZ","CLX","CL","GIS","SJM",
+        ],
+        "XLU": [   # Utilities
+            "NEE","DUK","SO","D","AEP","EXC","SRE","PEG","XEL","WEC",
+        ],
+        "XLRE": [  # Real Estate
+            "AMT","PLD","CCI","EQIX","PSA","SPG","O","VTR","EQR","AVB",
+        ],
+        "GLD":  ["GLD"],
+        "SLV":  ["SLV"],
+        "USO":  ["USO"],
+        "UNG":  ["UNG"],
+    }
 
-        # Max price filter — stocks above $300 result in < 3 shares per position
-        # which makes position sizing impractical for our $2k max position size
-        MAX_STOCK_PRICE = 300.0
+    def get_sector_movers(self, sector_etfs: list, top_n_per_sector: int = 8) -> list:
+        """
+        Sector-aware scanner. Given a list of top sector ETFs (e.g. ["XLK","XLF","XLE"]):
+          1. Looks up every stock belonging to those sectors
+          2. Fetches live snapshots in one batch API call
+          3. Ranks stocks WITHIN each sector by a combined % change + volume score
+          4. Returns top_n_per_sector from each sector, quality-filtered
+          5. Deduplicates across sectors
+
+        This ensures the scan list is always aligned with where market money is
+        flowing today — not just a fixed watchlist.
+        """
+        if not sector_etfs:
+            return []
+
+        MAX_PRICE = getattr(config, "MAX_STOCK_PRICE", 500.0)
+
+        # Build full candidate list from each requested sector
+        candidates = []
+        for etf in sector_etfs:
+            candidates.extend(self.SECTOR_UNIVERSE.get(etf, []))
+        candidates = list(dict.fromkeys(candidates))   # dedupe, preserve insertion order
+
+        if not candidates:
+            return []
 
         try:
-            snapshots = self.get_snapshot(universe)
-            # Filter out stocks too expensive for practical position sizing
+            snapshots  = self.get_snapshot(candidates)
             affordable = {
                 sym: data for sym, data in snapshots.items()
-                if data.get("price", 0) <= MAX_STOCK_PRICE
+                if 1.0 < data.get("price", 0) <= MAX_PRICE
             }
-            excluded = [s for s in snapshots if s not in affordable]
-            if excluded:
-                logger.debug(f"[SCANNER] Excluded high-price stocks: {excluded}")
-            ranked    = sorted(
+
+            # Score and rank within each sector, then merge
+            result = []
+            seen   = set()
+            for etf in sector_etfs:
+                members      = self.SECTOR_UNIVERSE.get(etf, [])
+                sector_snaps = {s: affordable[s] for s in members if s in affordable}
+                # Score = weighted combo of % move magnitude + volume activity
+                ranked = sorted(
+                    sector_snaps.items(),
+                    key=lambda x: (
+                        abs(x[1]["change_pct"]) * 0.6 +
+                        (x[1]["daily_volume"] / 1_000_000) * 0.4
+                    ),
+                    reverse=True,
+                )
+                sector_picks = []
+                for sym, data in ranked:
+                    if len(sector_picks) >= top_n_per_sector:
+                        break
+                    if sym in seen:
+                        continue
+                    ok, reason = self.is_quality_stock(sym)
+                    if ok:
+                        result.append(sym)
+                        seen.add(sym)
+                        sector_picks.append(sym)
+                    else:
+                        logger.debug(f"[SECTOR-SCAN] Quality skip {sym}: {reason}")
+
+                logger.info(
+                    f"[SECTOR-SCAN] {etf} → {len(sector_picks)} stocks: "
+                    f"{', '.join(sector_picks)}"
+                )
+            return result
+
+        except Exception as e:
+            logger.error(f"[SECTOR-SCAN] Error: {e}")
+            return []
+
+    def get_top_movers(self, top_n: int = 15) -> list:
+        """
+        Fallback sector-blind scanner. Used when sector data is unavailable.
+        Scans the full SECTOR_UNIVERSE by % change + volume, no sector weighting.
+        Prefer get_sector_movers() when sector rankings are available.
+        """
+        universe  = list(dict.fromkeys(
+            sym for members in self.SECTOR_UNIVERSE.values() for sym in members
+        ))
+        MAX_PRICE = getattr(config, "MAX_STOCK_PRICE", 500.0)
+
+        try:
+            snapshots  = self.get_snapshot(universe)
+            affordable = {
+                sym: data for sym, data in snapshots.items()
+                if 1.0 < data.get("price", 0) <= MAX_PRICE
+            }
+            ranked = sorted(
                 affordable.items(),
                 key=lambda x: (abs(x[1]["change_pct"]), x[1]["daily_volume"]),
                 reverse=True,
             )
-            # Apply quality filter — skip structurally broken stocks
             quality_symbols = []
             for sym, _ in ranked:
                 if len(quality_symbols) >= top_n:
@@ -318,13 +424,12 @@ class AlpacaClient:
                 if ok:
                     quality_symbols.append(sym)
                 else:
-                    logger.info(f"[SCANNER] Quality filter skipped {sym}: {reason}")
+                    logger.debug(f"[SCANNER] Quality skip {sym}: {reason}")
             return quality_symbols
         except Exception as e:
-            logger.error(f"Scanner error: {e}")
+            logger.error(f"[SCANNER] Error: {e}")
             return config.WATCHLIST[:top_n]
 
-    # ── Position Sizing ─────────────────────────────────────
     def get_atr(self, symbol: str, period: int = 14) -> float:
         """
         Calculate Average True Range (ATR) for a symbol.

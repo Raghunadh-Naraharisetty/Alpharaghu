@@ -17,13 +17,145 @@ os.chdir(ROOT)
 os.makedirs(os.path.join(ROOT, "logs"), exist_ok=True)
 os.makedirs(os.path.join(ROOT, "data"), exist_ok=True)
 
-# ── Logging ──────────────────────────────────────────────────
-fmt = logging.Formatter("%(asctime)s [%(name)s] %(levelname)s - %(message)s")
-ch  = logging.StreamHandler(sys.stdout); ch.setFormatter(fmt)
-fh  = logging.FileHandler(os.path.join(ROOT, "logs", "alpharaghu.log"), encoding="utf-8")
-fh.setFormatter(fmt)
-logging.basicConfig(level=logging.INFO, handlers=[ch, fh])
+# ── Rich console (beautiful terminal) ────────────────────────
+try:
+    from rich.console import Console as _RichConsole
+    from rich.panel   import Panel   as _RichPanel
+    from rich.table   import Table   as _RichTable
+    from rich         import box     as _richbox
+    _rcon = _RichConsole(highlight=False)
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
+    _rcon = None
+
+# ── Loguru (daily log rotation) ───────────────────────────────
+try:
+    from loguru import logger as _loguru
+    _loguru.remove()     # Remove default handler — we control all sinks
+    _loguru.add(
+        os.path.join(ROOT, "logs", "alpharaghu_{time:YYYY-MM-DD}.log"),
+        rotation="1 day",
+        retention="30 days",
+        level="INFO",
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<8} | {name} | {message}",
+        encoding="utf-8",
+        enqueue=True,          # Thread-safe async writes
+        backtrace=False,
+        diagnose=False,
+    )
+    HAS_LOGURU = True
+except ImportError:
+    HAS_LOGURU = False
+    _loguru   = None
+
+
+# ── Custom logging handlers ───────────────────────────────────
+class _RichHandler(logging.Handler):
+    """Replaces StreamHandler with color-coded Rich terminal output."""
+    _LEVEL_STYLE = {"ERROR": "bold red", "CRITICAL": "bold red on white",
+                    "WARNING": "yellow", "DEBUG": "dim"}
+
+    def emit(self, record):
+        if not HAS_RICH or _rcon is None:
+            print(self.format(record))
+            return
+        raw   = record.getMessage()
+        level = record.levelname
+        name  = record.name.replace("alpharaghu.", "").upper()
+        ts    = datetime.now().strftime("%H:%M:%S")
+
+        # ── Signal events get special treatment ─────────────
+        if "BUY FILLED" in raw:
+            parts = raw.replace("[BUY FILLED]", "").strip()
+            _rcon.print(f"[dim]{ts}[/dim] [bold bright_green]▲ BUY FILLED[/bold bright_green] [green]{parts}[/green]")
+        elif "TRAIL STOP" in raw:
+            parts = raw.replace("[TRAIL STOP]", "").strip()
+            _rcon.print(f"[dim]{ts}[/dim] [bold red]▼ TRAIL STOP[/bold red] [red]{parts}[/red]")
+        elif "SELL FILLED" in raw:
+            parts = raw.replace("[SELL FILLED]", "").strip()
+            _rcon.print(f"[dim]{ts}[/dim] [bold orange1]▼ SELL FILLED[/bold orange1] [orange1]{parts}[/orange1]")
+        elif "PARTIAL EXIT" in raw or "PARTIAL SELL" in raw:
+            _rcon.print(f"[dim]{ts}[/dim] [bold yellow]◑ PARTIAL EXIT[/bold yellow] [yellow]{raw}[/yellow]")
+        # ── Scan header ─────────────────────────────────────
+        elif "--- Scan #" in raw:
+            _rcon.print(f"\n[dim]{ts}[/dim] [bold cyan]{raw}[/bold cyan]")
+        # ── Symbol signal lines: "  APA: BUY | 35% | 2/3" ──
+        elif ": BUY |" in raw and "%" in raw:
+            _rcon.print(f"[dim]{ts}[/dim] [bold bright_green]{raw.strip()}[/bold bright_green]")
+        elif ": SELL |" in raw and "%" in raw:
+            _rcon.print(f"[dim]{ts}[/dim] [bold bright_red]{raw.strip()}[/bold bright_red]")
+        # ── Filters & blocks ────────────────────────────────
+        elif any(k in raw for k in ("BLOCK", "SKIP", "blocked", "cooldown", "MTF filter")):
+            _rcon.print(f"[dim]{ts} [{name}] {raw}[/dim]")
+        elif "STALE PRICE" in raw:
+            _rcon.print(f"[dim]{ts}[/dim] [bold orange1]⚠ {raw}[/bold orange1]")
+        # ── Sector scan ─────────────────────────────────────
+        elif "[SECTOR-SCAN]" in raw:
+            _rcon.print(f"[dim]{ts}[/dim] [blue]{raw}[/blue]")
+        elif "[SECTOR]" in raw:
+            _rcon.print(f"[dim]{ts}[/dim] [bold blue]{raw}[/bold blue]")
+        # ── Errors / warnings ───────────────────────────────
+        elif level in self._LEVEL_STYLE:
+            style = self._LEVEL_STYLE[level]
+            _rcon.print(f"[dim]{ts}[/dim] [{style}][{name}] {raw}[/{style}]")
+        # ── Default ─────────────────────────────────────────
+        else:
+            _rcon.print(f"[dim]{ts} [{name}][/dim] {raw}")
+
+
+class _LoguruFileHandler(logging.Handler):
+    """Routes stdlib logging into loguru for rotation-aware file output."""
+    def emit(self, record):
+        if not HAS_LOGURU:
+            return
+        try:
+            level = _loguru.level(record.levelname).name
+        except ValueError:
+            level = "INFO"
+        _loguru.opt(depth=8, exception=record.exc_info).log(
+            level, record.getMessage()
+        )
+
+
+# ── Wire up logging ───────────────────────────────────────────
+_rich_handler = _RichHandler()
+_handlers: list = [_rich_handler]
+if HAS_LOGURU:
+    _handlers.append(_LoguruFileHandler())
+else:
+    # Fallback: plain file if loguru not installed
+    _fh = logging.FileHandler(
+        os.path.join(ROOT, "logs", "alpharaghu.log"), encoding="utf-8"
+    )
+    _fh.setFormatter(logging.Formatter(
+        "%(asctime)s [%(name)s] %(levelname)s - %(message)s"
+    ))
+    _handlers.append(_fh)
+
+logging.basicConfig(level=logging.INFO, handlers=_handlers, force=True)
 logger = logging.getLogger("alpharaghu.engine")
+
+
+# ── Rich startup banner ───────────────────────────────────────
+def _print_banner(portfolio: float = 0.0):
+    if not HAS_RICH or _rcon is None:
+        return
+    tools = "[green]+[/green]" 
+    body = (
+        f"[bold cyan]ALPHARAGHU[/bold cyan]  [dim]v4.0[/dim]\n"
+        f"[dim]Algorithmic Trading Engine[/dim]\n\n"
+        f"[green]+[/green] Earnings Filter   [green]+[/green] Sector Rotation\n"
+        f"[green]+[/green] Partial Exits     [green]+[/green] Trail 2nd Half\n"
+        f"[green]+[/green] Trailing Stops    [green]+[/green] Drawdown Breaker\n"
+        f"[green]+[/green] Trade Database    [green]+[/green] MTF Trend Filter\n"
+        f"[green]+[/green] pandas-ta (ADX/Supertrend/StochRSI)\n"
+        f"[green]+[/green] Rich Terminal     [green]+[/green] Loguru Rotation\n"
+        f"[green]+[/green] Plotly Dashboard  [green]+[/green] Backtester\n"
+    )
+    if portfolio > 0:
+        body += f"\n[dim]Portfolio:[/dim] [bold green]${portfolio:,.2f}[/bold green]"
+    _rcon.print(_RichPanel(body, border_style="cyan", padding=(1, 4)))
 
 # ── Module loader ─────────────────────────────────────────────
 def load(name, *parts):
@@ -98,12 +230,15 @@ def log_signal_json(result):
 class AlpharaghuEngine:
 
     def __init__(self):
+        _print_banner()
         logger.info("=" * 60)
         logger.info("  ALPHARAGHU v4.0 - Algo Trading Engine")
         logger.info("  + Earnings Filter | + Sector Rotation ")
         logger.info("  + Partial Exits   | + Trail 2nd Half  ")
         logger.info("  + Trailing Stops | + Drawdown Breaker")
         logger.info("  + Trade Database | + MTF Trend Filter")
+        logger.info("  + pandas-ta       | + Rich Terminal   ")
+        logger.info("  + Plotly Charts   | + Backtester      ")
         logger.info("=" * 60)
 
         self.alpaca   = AlpacaClient()
@@ -112,6 +247,13 @@ class AlpharaghuEngine:
         self.news     = NewsFetcher(alpaca_client=self.alpaca)
         self.db       = TradeDatabase()
         self.risk     = RiskManager(self.alpaca)
+
+        # Print banner with live portfolio value now that we're connected
+        try:
+            acct = self.alpaca.get_account()
+            _print_banner(float(acct.portfolio_value))
+        except Exception:
+            pass
 
         self.scan_count   = 0
         self.signal_count = 0
@@ -147,10 +289,38 @@ class AlpharaghuEngine:
             combined = list(dict.fromkeys(gappers + list(config.WATCHLIST)))
             return combined[:40]
 
-        # Regular market hours
-        symbols = list(config.WATCHLIST)
+        # Regular market hours — build sector-aware scan list
+        base = list(config.WATCHLIST)
+
         if config.USE_DYNAMIC_SCANNER:
-            symbols = list(set(symbols + self.alpaca.get_top_movers(top_n=15)))
+            # Step 1: get top sectors from the sector rotation filter (cached 30min)
+            top_sectors = []
+            try:
+                top_sectors = self.sector.get_top_sectors()   # e.g. ["XLK","XLF","XLE"]
+            except Exception as _se:
+                logger.warning(f"[SCAN] Sector ranking unavailable: {_se}")
+
+            if top_sectors:
+                # Step 2: pull top movers FROM those sectors (8 per sector = 24 focused picks)
+                sector_picks = self.alpaca.get_sector_movers(
+                    sector_etfs=top_sectors,
+                    top_n_per_sector=getattr(config, "SECTOR_SCAN_TOP_N_PER_SECTOR", 8),
+                )
+                # Merge: watchlist first (always scanned), then sector picks
+                symbols = list(dict.fromkeys(base + sector_picks))
+                logger.info(
+                    f"[SCAN] {len(symbols)} symbols — "
+                    f"{len(base)} watchlist + {len(sector_picks)} sector picks "
+                    f"({', '.join(top_sectors)})"
+                )
+            else:
+                # Fallback to broad scanner if sector data unavailable
+                fallback = self.alpaca.get_top_movers(top_n=15)
+                symbols  = list(dict.fromkeys(base + fallback))
+                logger.info(f"[SCAN] {len(symbols)} symbols (fallback — no sector data)")
+        else:
+            symbols = base
+
         return symbols
 
     # ── Main scan ─────────────────────────────────────────────
@@ -573,8 +743,13 @@ class AlpharaghuEngine:
     # ── Main loop ─────────────────────────────────────────────
     def run(self):
         logger.info("Engine starting...")
-        symbols = self.get_symbols()
-        self.telegram.send_startup(len(symbols), symbols)
+        symbols     = self.get_symbols()
+        top_sectors = []
+        try:
+            top_sectors = self.sector.get_top_sectors()
+        except Exception:
+            pass
+        self.telegram.send_startup(len(config.WATCHLIST), symbols, top_sectors=top_sectors)
 
         # Log existing positions
         positions = self.alpaca.get_positions()

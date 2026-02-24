@@ -41,6 +41,10 @@ ATR_TARGET_MULTIPLIER = float(os.getenv("ATR_TARGET_MULTIPLIER", 4.0))  # target
 # ── Scanner Settings ────────────────────────────────────────
 USE_DYNAMIC_SCANNER      = os.getenv("USE_DYNAMIC_SCANNER", "true").lower() == "true"
 
+# Sector-aware scanner: how many top movers to pull per sector
+# Top 3 sectors × 8 picks each = 24 sector-focused stocks added to watchlist
+SECTOR_SCAN_TOP_N_PER_SECTOR = int(os.getenv("SECTOR_SCAN_TOP_N_PER_SECTOR", 8))
+
 # Pivot-level stops (S1/S2 as stop, R1 as target) — more precise than fixed %
 USE_PIVOT_STOPS          = os.getenv("USE_PIVOT_STOPS", "true").lower() == "true"
 

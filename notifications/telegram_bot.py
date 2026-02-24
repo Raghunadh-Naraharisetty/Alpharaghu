@@ -133,12 +133,27 @@ class TelegramBot:
         return sent
 
     # ── Startup message ──────────────────────────────────────
-    def send_startup(self, symbol_count: int, watchlist: list) -> bool:
-        now = datetime.now().strftime("%H:%M")
+    def send_startup(self, symbol_count: int, watchlist: list,
+                     top_sectors: list = None) -> bool:
+        now       = datetime.now().strftime("%H:%M")
+        max_pos   = getattr(config, "MAX_OPEN_POSITIONS", 0)
+        max_str   = "unlimited" if max_pos == 0 else str(max_pos)
+        n_per_sec = getattr(config, "SECTOR_SCAN_TOP_N_PER_SECTOR", 8)
+        n_sectors = len(top_sectors) if top_sectors else 3
+        dyn_count = n_sectors * n_per_sec   # sector picks added on top of watchlist
+
+        sector_line = ""
+        if top_sectors:
+            sector_line = f"\n📊 Top sectors: {' · '.join(top_sectors)}"
+        else:
+            sector_line = f"\n📊 Sector scan: loading…"
+
         msg = (
             f"🤖 <b>ALPHARAGHU online</b>  {now}\n"
-            f"Scanning ~{symbol_count + 15} symbols every {config.SCAN_INTERVAL_MINUTES}m\n"
-            f"Risk {config.RISK_PER_TRADE_PCT}% | Max {config.MAX_OPEN_POSITIONS} positions"
+            f"Scanning {symbol_count} watchlist + ~{dyn_count} sector picks "
+            f"every {config.SCAN_INTERVAL_MINUTES}m"
+            f"{sector_line}\n"
+            f"Risk {config.RISK_PER_TRADE_PCT}%  |  Positions: {max_str}"
         )
         return self.send(msg)
 
