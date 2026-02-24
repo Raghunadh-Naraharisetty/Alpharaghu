@@ -55,11 +55,33 @@ class RiskManager:
         """
         Updates trailing stop for a position.
         Returns: { "action": "hold"|"close", "stop_price": float, "reason": str }
+
+        Morning protection: trailing stops are suppressed for the first
+        TRAIL_SUPPRESS_OPEN_MINUTES minutes after market open (9:30 ET).
+        This prevents getting whipped out by opening volatility before
+        a proper intraday trend has established itself.
         """
+        from datetime import time as dtime
+        now_et = datetime.now()   # Assumes server runs in ET or adjust as needed
+        market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        suppress_mins = getattr(config, "TRAIL_SUPPRESS_OPEN_MINUTES", 30)
+        in_morning_window = (
+            now_et.weekday() < 5 and   # Mon-Fri only
+            dtime(9, 30) <= now_et.time() <=
+            (now_et.replace(hour=9, minute=30 + suppress_mins)).time()
+        )
+        if in_morning_window:
+            regular_stop = entry_price * (1 - getattr(config, "STOP_LOSS_PCT", 2.0) / 100)
+            return {
+                "action":     "hold",
+                "stop_price": regular_stop,
+                "reason":     f"morning window — trail suppressed first {suppress_mins}min"
+            }
+
         pnl_pct = (current_price - entry_price) / entry_price * 100
 
         # Only activate trailing stop after TRAILING_ACTIVATION_PCT profit
-        activation = getattr(config, "TRAILING_STOP_ACTIVATION_PCT", 2.0)
+        activation = getattr(config, "TRAILING_STOP_ACTIVATION_PCT", 3.5)
         trail_dist  = getattr(config, "TRAILING_STOP_DISTANCE_PCT",  1.0)
 
         if pnl_pct < activation:

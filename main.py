@@ -1,5 +1,5 @@
 """
-ALPHARAGHU - Main Trading Engine v2.0
+ALPHARAGHU - Main Trading Engine v4.0
 New in this version:
   - Trailing stops (locks in profit)
   - Drawdown circuit breaker (emergency halt)
@@ -45,6 +45,9 @@ tg_mod       = load("telegram_bot",  "notifications",  "telegram_bot.py")
 news_mod     = load("news_fetcher",  "data",           "news_fetcher.py")
 db_mod       = load("trade_db",      "utils",          "trade_database.py")
 risk_mod     = load("risk_manager",  "utils",          "risk_manager.py")
+earn_mod     = load("earnings_filter",   "utils",      "earnings_filter.py")
+sector_mod   = load("sector_rotation",   "utils",      "sector_rotation.py")
+partial_mod  = load("partial_exit_mgr",  "utils",      "partial_exit_manager.py")
 
 AlpacaClient           = alpaca_mod.AlpacaClient
 StrategyCombiner       = combiner_mod.StrategyCombiner
@@ -53,6 +56,9 @@ TelegramCommandHandler = tg_mod.TelegramCommandHandler
 NewsFetcher            = news_mod.NewsFetcher
 TradeDatabase          = db_mod.TradeDatabase
 RiskManager            = risk_mod.RiskManager
+EarningsFilter         = earn_mod.EarningsFilter
+SectorRotationFilter   = sector_mod.SectorRotationFilter
+PartialExitManager     = partial_mod.PartialExitManager
 logger.info("All modules loaded OK")
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -93,7 +99,9 @@ class AlpharaghuEngine:
 
     def __init__(self):
         logger.info("=" * 60)
-        logger.info("  ALPHARAGHU v2.0 - Algo Trading Engine")
+        logger.info("  ALPHARAGHU v4.0 - Algo Trading Engine")
+        logger.info("  + Earnings Filter | + Sector Rotation ")
+        logger.info("  + Partial Exits   | + Trail 2nd Half  ")
         logger.info("  + Trailing Stops | + Drawdown Breaker")
         logger.info("  + Trade Database | + MTF Trend Filter")
         logger.info("=" * 60)
@@ -108,6 +116,12 @@ class AlpharaghuEngine:
         self.scan_count   = 0
         self.signal_count = 0
         self.active_signals = {}
+
+        # ── New v4 modules ─────────────────────────────────────
+        self.earnings = EarningsFilter(self.alpaca)
+        self.sector   = SectorRotationFilter(self.alpaca)
+        self.partial  = PartialExitManager()
+        logger.info("[v4] Earnings filter, sector rotation, partial exits ready")
 
         # Telegram commands for mobile control
         self.cmd_handler = TelegramCommandHandler(self.telegram, engine_ref=self)
@@ -216,8 +230,15 @@ class AlpharaghuEngine:
         except Exception as e:
             logger.error(f"Scan summary error: {e}")
 
-    # ── Manage open positions (trailing stops) ─────────────────
+    # ── Manage open positions (trailing stops + partial exits) ──
     def _manage_positions(self):
+        # Partial exit manager runs FIRST — it may close half a position
+        # before the trailing stop logic even sees it
+        try:
+            self.partial.monitor(self.alpaca, self.telegram)
+        except Exception as e:
+            logger.error(f"Partial exit monitor error: {e}")
+
         positions = self.alpaca.get_positions()
         for p in positions:
             symbol       = p.symbol
@@ -238,6 +259,9 @@ class AlpharaghuEngine:
                 )
                 # Record in DB
                 self.db.record_close(symbol, current_price, trail["reason"])
+                # Apply cooldown so bot doesn't immediately re-enter
+                self.risk.record_trade(symbol)
+                logger.info(f"  [COOL] {symbol}: cooldown started after trail exit")
 
     # ── Analyze single symbol ──────────────────────────────────
     def _analyze_symbol(self, symbol, open_positions):
@@ -292,7 +316,46 @@ class AlpharaghuEngine:
         price = df_15["close"].iloc[-1]
         pos   = self.alpaca.get_position(symbol)
 
-        if signal == "BUY" and not pos and open_positions < config.MAX_OPEN_POSITIONS:
+        # MAX_OPEN_POSITIONS == 0 means unlimited (paper trading mode)
+        _max_pos = getattr(config, "MAX_OPEN_POSITIONS", 0)
+        _pos_ok  = (_max_pos == 0) or (open_positions < _max_pos)
+
+        if signal == "BUY" and pos:
+            logger.info(f"  {symbol}: SKIP — already holding position")
+            return result
+
+        if signal == "BUY" and not pos and _pos_ok:
+
+            # ── Minimum confidence gate ───────────────────────
+            min_conf = getattr(config, "MIN_BUY_CONFIDENCE", 0.35)
+            if conf < min_conf:
+                logger.info(
+                    f"  {symbol}: SKIP — confidence {conf:.0%} "
+                    f"below minimum {min_conf:.0%}"
+                )
+                return result
+
+            # ── Earnings filter — hard block near earnings ─────
+            earn_ok, earn_reason = self.earnings.check(
+                symbol,
+                sentiment_score=result.get("buy_confidence", 0.5),
+                vol_ratio=float(
+                    result.get("indicators", {}).get("momentum", {})
+                    .get("vol_ratio", 1.0) if isinstance(
+                        result.get("indicators"), dict) else 1.0
+                ),
+            )
+            if not earn_ok:
+                logger.info(f"  {symbol}: EARNINGS BLOCK — {earn_reason}")
+                return result
+
+            # ── Sector rotation — only trade top sectors ───────
+            sect_ok, sect_reason = self.sector.is_allowed(symbol)
+            if not sect_ok:
+                logger.info(f"  {symbol}: SECTOR BLOCK — {sect_reason}")
+                return result
+            logger.debug(f"  {symbol}: sector OK — {sect_reason}")
+
             self._execute_buy(symbol, price, result)
 
         elif signal == "SELL" and pos:
@@ -366,6 +429,28 @@ class AlpharaghuEngine:
                     f"Target=${target_price:.2f} | Pivots={pivots}"
                 )
 
+        # ── Staleness guard — validate signal price vs live price ─
+        stale_pct = getattr(config, "PRICE_STALENESS_WARN_PCT", 5.0)
+        try:
+            live_q = self.alpaca.get_latest_quote(symbol)
+            if live_q and live_q.get("mid"):
+                live_p = live_q["mid"]
+                drift  = abs(live_p - price) / price * 100
+                if drift > stale_pct:
+                    logger.warning(
+                        f"  {symbol}: STALE PRICE ALERT "
+                        f"signal=${price:.2f} live=${live_p:.2f} "
+                        f"({drift:.1f}% drift — recalculating ATR from live)"
+                    )
+                    # Recalculate stops/targets from the live price
+                    atr_live = self.alpaca.get_atr(symbol)
+                    if atr_live > 0:
+                        stop_price   = live_p - atr_live * getattr(config, "ATR_STOP_MULTIPLIER", 2.0)
+                        target_price = live_p + atr_live * getattr(config, "ATR_TARGET_MULTIPLIER", 4.0)
+                    price = live_p   # use live price as entry reference
+        except Exception as _sg_e:
+            logger.debug(f"  {symbol}: staleness check error: {_sg_e}")
+
         qty = self.alpaca.calculate_position_size(price, stop_price, symbol=symbol)
 
         order = self.alpaca.place_market_order(
@@ -387,6 +472,14 @@ class AlpharaghuEngine:
             self.risk.record_trade(symbol)
             logger.info(f"  [BUY FILLED] {qty:.2f}x {symbol} @ ~${price:.2f}")
             self.telegram.send_signal(result)
+
+            # Register with partial exit manager for 50%/trail management
+            try:
+                atr_val = self.alpaca.get_atr(symbol)
+                if atr_val > 0:
+                    self.partial.register(symbol, price, qty, atr_val)
+            except Exception as pe:
+                logger.error(f"  [PARTIAL] Register error for {symbol}: {pe}")
 
     # ── Execute SELL ──────────────────────────────────────────
     def _execute_sell(self, symbol, price, result, position):
@@ -426,89 +519,54 @@ class AlpharaghuEngine:
 
     # ── Morning Market Briefing ───────────────────────────────
     def send_morning_briefing(self):
-        """
-        Sends an AI-generated market briefing at 9:00 AM ET.
-        Covers: VIX level, SPY trend, key levels to watch, macro events.
-        Uses current bar data from Alpaca — no external API needed.
-        """
+        """Compact 9 AM market briefing — glanceable in 5 seconds."""
         try:
             from zoneinfo import ZoneInfo
             ET = ZoneInfo("America/New_York")
-            now_et = datetime.now(ET)
 
-            # Gather live market data
             spy_bars = self.alpaca.get_bars("SPY", "1Day", limit=21)
-            vix_bars = self.alpaca.get_bars("VIXY", "1Day", limit=5)  # VIXY as VIX proxy
-
+            vix_bars = self.alpaca.get_bars("VIXY", "1Day", limit=3)
             if spy_bars.empty:
-                logger.warning("Morning briefing: no SPY data")
                 return
 
-            spy_price   = float(spy_bars["close"].iloc[-1])
-            spy_prev    = float(spy_bars["close"].iloc[-2])
-            spy_change  = (spy_price - spy_prev) / spy_prev * 100
-            spy_sma20   = float(spy_bars["close"].rolling(20).mean().iloc[-1])
-            spy_sma50   = float(spy_bars["close"].rolling(min(50, len(spy_bars))).mean().iloc[-1])
+            spy  = float(spy_bars["close"].iloc[-1])
+            prev = float(spy_bars["close"].iloc[-2])
+            chg  = (spy - prev) / prev * 100
+            s20  = float(spy_bars["close"].rolling(20).mean().iloc[-1])
+            s50  = float(spy_bars["close"].rolling(min(50,len(spy_bars))).mean().iloc[-1])
 
-            # VIX proxy via VIXY
-            vixy_price  = float(vix_bars["close"].iloc[-1]) if not vix_bars.empty else 0
-            vixy_prev   = float(vix_bars["close"].iloc[-2]) if len(vix_bars) >= 2 else vixy_price
-            vixy_change = (vixy_price - vixy_prev) / vixy_prev * 100 if vixy_prev else 0
+            if spy > s20 > s50:   regime = "🟢"
+            elif spy < s20 < s50: regime = "🔴"
+            else:                 regime = "🟡"
 
-            # Determine market regime
-            if spy_price > spy_sma20 > spy_sma50:
-                regime = "🟢 BULLISH — Price > SMA20 > SMA50"
-            elif spy_price < spy_sma20 < spy_sma50:
-                regime = "🔴 BEARISH — Price < SMA20 < SMA50"
-            else:
-                regime = "🟡 MIXED — Transitional market"
+            vixy = float(vix_bars["close"].iloc[-1]) if not vix_bars.empty else 0
+            if vixy < 20:      fear = "calm"
+            elif vixy < 30:    fear = "normal"
+            elif vixy < 40:    fear = "elevated ⚠️"
+            else:              fear = "EXTREME 🚨"
 
-            # VIX reading interpretation
-            if vixy_price < 20:
-                vix_read = "Low fear — complacent market"
-            elif vixy_price < 30:
-                vix_read = "Moderate volatility — normal conditions"
-            elif vixy_price < 40:
-                vix_read = "Elevated fear — tread carefully"
-            else:
-                vix_read = "EXTREME FEAR — high-volatility regime"
-
-            # SPY pivot levels for the day
-            spy_pivots = self.alpaca.get_pivot_levels("SPY")
-            pivot_str = ""
-            if spy_pivots:
-                pivot_str = (
-                    f"\n📐 <b>SPY Key Levels Today:</b>"
-                    f"\n  R2: ${spy_pivots.get('R2', 0):.2f}  |  R1: ${spy_pivots.get('R1', 0):.2f}"
-                    f"\n  Pivot: ${spy_pivots.get('pivot', 0):.2f}"
-                    f"\n  S1: ${spy_pivots.get('S1', 0):.2f}  |  S2: ${spy_pivots.get('S2', 0):.2f}"
+            pivots = self.alpaca.get_pivot_levels("SPY")
+            piv_line = ""
+            if pivots:
+                piv_line = (
+                    f"\nSPY levels: R1 ${pivots['R1']:.0f}  "
+                    f"P ${pivots['pivot']:.0f}  S1 ${pivots['S1']:.0f}"
                 )
 
-            # Open positions snapshot
             positions = self.alpaca.get_positions()
-            pos_str = ""
+            pos_line  = ""
             if positions:
                 total_pl = sum(float(p.unrealized_pl) for p in positions)
-                pos_str  = f"\n💼 <b>Open Positions:</b> {len(positions)} | Unrealized P&amp;L: ${total_pl:+.2f}"
+                pos_line = f"\n{len(positions)} positions  P&amp;L {total_pl:+.0f}"
 
             msg = (
-                f"🌅 <b>ALPHARAGHU — Morning Briefing</b>"
-                f"\n{now_et.strftime('%A %b %d, %Y — %I:%M %p ET')}"
-                f"\n{'─' * 32}"
-                f"\n\n📊 <b>SPY:</b> ${spy_price:.2f} ({spy_change:+.2f}%)"
-                f"\n   SMA20: ${spy_sma20:.2f}  |  SMA50: ${spy_sma50:.2f}"
-                f"\n   {regime}"
-                f"\n\n😰 <b>VIXY (Fear):</b> ${vixy_price:.2f} ({vixy_change:+.2f}%)"
-                f"\n   {vix_read}"
-                f"{pivot_str}"
-                f"{pos_str}"
-                f"\n\n⚡ <b>Strategy:</b> Scanning {len(config.WATCHLIST)} symbols every "
-                f"{config.SCAN_INTERVAL_MINUTES} min"
-                f"\n🤖 Bot is armed and scanning. Good luck!"
+                f"🌅 <b>Morning  SPY {spy:.0f} ({chg:+.1f}%)</b>  {regime}\n"
+                f"VIXY {vixy:.1f}  Fear: {fear}"
+                f"{piv_line}"
+                f"{pos_line}"
             )
-
             self.telegram.send_both(msg)
-            logger.info("Morning briefing sent to Telegram")
+            logger.info("Morning briefing sent")
         except Exception as e:
             logger.error(f"Morning briefing error: {e}")
 
