@@ -95,35 +95,50 @@ class TelegramBot:
         self.send(text, parse_mode)
         self.send_to_channel(text, parse_mode)
 
+    # ── Chart via sendPhoto ───────────────────────────────────
+    def send_chart(self, symbol: str, png_bytes: bytes,
+                   caption: str = "") -> bool:
+        """
+        Send a PNG chart image to private chat + channel via Telegram sendPhoto.
+        No file storage required — sends raw bytes directly.
+        """
+        if not self.enabled or not png_bytes:
+            return False
+        sent = False
+        targets_chat = [self.chat_id]
+        if self.channel_enabled:
+            targets_chat.append(self.channel_id)
+        for chat_id in targets_chat:
+            try:
+                url  = self.BASE.format(token=self.token, method="sendPhoto")
+                resp = requests.post(
+                    url,
+                    data={
+                        "chat_id":    chat_id,
+                        "caption":    caption[:1024],
+                        "parse_mode": "HTML",
+                    },
+                    files={"photo": (f"{symbol}_chart.png", png_bytes, "image/png")},
+                    timeout=20,
+                )
+                if resp.status_code == 200:
+                    sent = True
+                else:
+                    logger.error(
+                        f"[CHART] sendPhoto failed chat={chat_id}: "
+                        f"{resp.status_code} {resp.text[:150]}"
+                    )
+            except Exception as e:
+                logger.error(f"[CHART] sendPhoto error chat={chat_id}: {e}")
+        return sent
+
     # ── Startup message ──────────────────────────────────────
     def send_startup(self, symbol_count: int, watchlist: list) -> bool:
-        now = datetime.now().strftime("%H:%M:%S")
-        dynamic_extra = 15 if getattr(config, "USE_DYNAMIC_SCANNER", True) else 0
-        total_symbols = symbol_count + dynamic_extra
-        scanner_note  = (
-            f"{symbol_count} watchlist + ~{dynamic_extra} top movers (dynamic)"
-            if dynamic_extra else f"{symbol_count} watchlist only"
-        )
+        now = datetime.now().strftime("%H:%M")
         msg = (
-            f"<b>ALPHARAGHU Bot Started</b>\n\n"
-            f"Interval: {config.SCAN_INTERVAL_MINUTES}m\n"
-            f"Watching: ~{total_symbols} symbols\n"
-            f"  ({scanner_note})\n\n"
-            f"<b>Strategy 1 - Momentum:</b>\n"
-            f"  EMA50, EMA200, RSI(14), MACD(12/26/9), Volume\n\n"
-            f"<b>Strategy 2 - Mean Reversion:</b>\n"
-            f"  Bollinger Bands(20), Stochastic(14/3), ATR(14)\n\n"
-            f"<b>Strategy 3 - News Sentiment:</b>\n"
-            f"  Alpaca News, Earnings Growth, Revenue Growth\n\n"
-            f"Consensus: 2/3 strategies must agree\n"
-            f"News filter: ON\n"
-            f"Earnings guard: ON\n"
-            f"Risk/trade: {config.RISK_PER_TRADE_PCT}% | "
-            f"Stop: {config.STOP_LOSS_PCT}% | "
-            f"Target: {config.TAKE_PROFIT_PCT}%\n"
-            f"Max positions: {config.MAX_OPEN_POSITIONS}\n"
-            f"Time: {now}\n\n"
-            f"<i>Scan summary sent every {config.SCAN_INTERVAL_MINUTES}m</i>"
+            f"🤖 <b>ALPHARAGHU online</b>  {now}\n"
+            f"Scanning ~{symbol_count + 15} symbols every {config.SCAN_INTERVAL_MINUTES}m\n"
+            f"Risk {config.RISK_PER_TRADE_PCT}% | Max {config.MAX_OPEN_POSITIONS} positions"
         )
         return self.send(msg)
 
@@ -133,129 +148,87 @@ class TelegramBot:
                           scan_results: list = None,
                           positions: list = None) -> bool:
         """
-        Sends a rich per-scan summary to Telegram.
-        scan_results: list of all symbol results (not just signals)
+        Minimal scan summary — quiet when nothing's happening,
+        informative when there are signals or notable position moves.
         """
-        now     = datetime.now().strftime("%H:%M:%S")
+        now      = datetime.now().strftime("%H:%M")
         sig_buy  = [s for s in signals if s.get("signal") == "BUY"]
         sig_sell = [s for s in signals if s.get("signal") == "SELL"]
 
-        # ── Header ───────────────────────────────────────────
-        lines = [
-            f"<b>Scan #{scan_num}</b>   {now}",
-            f"",
-            f"Checked: {checked}/{total} symbols",
-            f"Signals: {len(signals)}  "
-            f"(BUY: {len(sig_buy)}  SELL: {len(sig_sell)})",
-        ]
+        lines = []
 
-        # ── BUY signals ───────────────────────────────────────
-        if sig_buy:
-            lines.append("")
-            lines.append("<b>BUY Signals:</b>")
-            for s in sig_buy:
-                conf = s.get("confidence", 0)
-                cons = s.get("consensus", 0)
-                t    = s.get("targets", {})
-                entry  = t.get("entry",  "?")
-                stop   = t.get("stop",   "?")
-                target = t.get("target", "?")
-                lines.append(
-                    f"  BUY <b>{s['symbol']}</b> "
-                    f"| {conf:.0%} conf | {cons}/3"
-                )
-                if entry != "?":
-                    lines.append(
-                        f"    Entry: ${entry}  Stop: ${stop}  TP: ${target}"
-                    )
+        # ── Signals (always show if present) ──────────────────
+        for s in sig_buy:
+            t   = s.get("targets", {})
+            ep  = f"${t['entry']}" if t.get("entry") else "mkt"
+            sl  = f"${t['stop']}"  if t.get("stop")  else "—"
+            tp  = f"${t['target']}"if t.get("target") else "—"
+            lines.append(
+                f"📈 <b>BUY {s['symbol']}</b>  {s.get('confidence',0):.0%}\n"
+                f"   EP {ep}  SL {sl}  TP {tp}"
+            )
 
-        # ── SELL signals ──────────────────────────────────────
-        if sig_sell:
-            lines.append("")
-            lines.append("<b>SELL Signals:</b>")
-            for s in sig_sell:
-                conf = s.get("confidence", 0)
-                cons = s.get("consensus", 0)
-                lines.append(
-                    f"  SELL <b>{s['symbol']}</b> "
-                    f"| {conf:.0%} conf | {cons}/3"
-                )
+        for s in sig_sell:
+            lines.append(
+                f"📉 <b>SELL {s['symbol']}</b>  {s.get('confidence',0):.0%}"
+            )
 
-        # ── No signals ────────────────────────────────────────
-        if not signals:
-            lines.append("")
-            lines.append("No signals this scan")
-
-        # ── Top movers watched (from scan_results) ────────────
-        if scan_results:
-            # Show top 5 by absolute confidence (closest to triggering)
-            near_signals = sorted(
+        # ── Near signals (watching list) ──────────────────────
+        if scan_results and not signals:
+            near = sorted(
                 [r for r in scan_results if r.get("signal") == "HOLD"
-                 and max(r.get("buy_confidence", 0), r.get("sell_confidence", 0)) > 0.35],
-                key=lambda x: max(x.get("buy_confidence", 0), x.get("sell_confidence", 0)),
+                 and max(r.get("buy_confidence",0), r.get("sell_confidence",0)) > 0.38],
+                key=lambda x: max(x.get("buy_confidence",0), x.get("sell_confidence",0)),
                 reverse=True
-            )[:5]
-            if near_signals:
-                lines.append("")
-                lines.append("<b>Near Signals (watching):</b>")
-                for r in near_signals:
-                    bc  = r.get("buy_confidence",  0)
-                    sc  = r.get("sell_confidence", 0)
-                    if bc >= sc:
-                        direction = f"BUY  {bc:.0%}"
-                    else:
-                        direction = f"SELL {sc:.0%}"
-                    lines.append(f"  {r['symbol']}: {direction}")
+            )[:3]
+            if near:
+                watching = "  ".join(
+                    f"{r['symbol']} {max(r.get('buy_confidence',0),r.get('sell_confidence',0)):.0%}"
+                    for r in near
+                )
+                lines.append(f"👀 Watching: {watching}")
 
-        # ── Portfolio ─────────────────────────────────────────
+        # ── Portfolio one-liner ────────────────────────────────
         if account:
             try:
-                portfolio = float(account.portfolio_value)
-                cash      = float(account.cash)
-                equity    = float(account.equity)
-                last_eq   = float(account.last_equity)
-                pl        = equity - last_eq
-                pl_pct    = (pl / last_eq * 100) if last_eq else 0
-                pl_sign   = "+" if pl >= 0 else ""
-                lines += [
-                    "",
-                    f"Portfolio: <b>${portfolio:,.2f}</b>",
-                    f"Cash: ${cash:,.2f}",
-                    f"Day P&amp;L: ${pl_sign}{pl:,.2f} ({pl_sign}{pl_pct:.2f}%)",
-                ]
+                pl     = float(account.equity) - float(account.last_equity)
+                port   = float(account.portfolio_value)
+                n_pos  = len(positions) if positions is not None else "?"
+                sign   = "+" if pl >= 0 else ""
+                lines.append(
+                    f"💼 ${port:,.0f}  Day {sign}${pl:,.0f}  {n_pos} pos"
+                )
             except Exception:
                 pass
 
-        # ── Open Positions (ALL — including manually placed) ────
-        if positions is not None:
-            lines.append("")
-            if len(positions) == 0:
-                lines.append("Positions: None")
-            else:
-                lines.append(f"<b>Open Positions ({len(positions)}):</b>")
-                total_pl = 0.0
-                for p in positions:
-                    try:
-                        pl     = float(p.unrealized_pl)
-                        plpc   = float(p.unrealized_plpc) * 100
-                        qty    = float(p.qty)
-                        entry  = float(p.avg_entry_price)
-                        cur    = float(p.current_price)
-                        total_pl += pl
-                        sign   = "+" if pl >= 0 else ""
-                        lines.append(
-                            f"  <b>{p.symbol}</b>: {qty:.0f} sh "
-                            f"@ ${entry:.2f} → ${cur:.2f} "
-                            f"| P&amp;L: ${sign}{pl:.2f} ({sign}{plpc:.1f}%)"
-                        )
-                    except Exception:
-                        lines.append(f"  {p.symbol}: (data error)")
-                sign = "+" if total_pl >= 0 else ""
-                lines.append(f"  Total P&amp;L: <b>${sign}{total_pl:.2f}</b>")
+        # ── Positions — only show if P&L is notable (>$5 move) ──
+        if positions:
+            notable = [
+                p for p in positions
+                if abs(float(p.unrealized_pl)) > 5
+            ]
+            if notable:
+                pos_parts = []
+                for p in notable:
+                    pl   = float(p.unrealized_pl)
+                    plpc = float(p.unrealized_plpc) * 100
+                    pos_parts.append(f"{p.symbol} {plpc:+.1f}%")
+                lines.append("   " + "  ".join(pos_parts))
 
-        # ── Footer ────────────────────────────────────────────
-        lines.append("")
-        lines.append(f"<i>Next scan in {config.SCAN_INTERVAL_MINUTES}m</i>")
+        # ── Footer — quiet scan (no noise if nothing happened) ──
+        if not lines:
+            # Completely silent scan — just a tiny heartbeat every 4 scans
+            if scan_num % 4 == 0:
+                lines.append(f"· #{scan_num}  {now}  scanning {checked} symbols")
+            else:
+                return True  # Send nothing — truly silent
+
+        # Prepend scan number if we have real content
+        if lines and (signals or (scan_results and any(
+            max(r.get("buy_confidence",0),r.get("sell_confidence",0)) > 0.38
+            for r in (scan_results or []) if r.get("signal") == "HOLD"
+        ))):
+            lines.insert(0, f"<b>Scan #{scan_num}</b>  {now}")
 
         return self.send("\n".join(lines))
 
@@ -268,95 +241,138 @@ class TelegramBot:
         if signal not in ("BUY", "SELL"):
             return False
 
-        direction = "BUY SIGNAL" if signal == "BUY" else "SELL SIGNAL"
-        strat_lines = result.get("reason_lines", [])
-        strat_text  = "\n".join(f"  {l}" for l in strat_lines)
-
+        emoji   = "📈" if signal == "BUY" else "📉"
         targets = result.get("targets", {})
-        t_text  = ""
+        t_line  = ""
         if targets:
-            t_text = (
-                f"\nEntry:       <code>${targets.get('entry','?')}</code>\n"
-                f"Stop Loss:   <code>${targets.get('stop','?')}</code>\n"
-                f"Take Profit: <code>${targets.get('target','?')}</code>"
+            t_line = (
+                f"\nEP <code>${targets.get('entry','?')}</code>  "
+                f"SL <code>${targets.get('stop','?')}</code>  "
+                f"TP <code>${targets.get('target','?')}</code>"
             )
 
-        # ── Private chat: full detail ─────────────────────────
-        msg_private = (
-            f"<b>{direction} — {symbol}</b>\n"
-            f"Confidence: {conf:.0%} | {consensus}/3 strategies\n"
-            f"{t_text}\n\n"
-            f"<b>Breakdown:</b>\n{strat_text}\n\n"
-            f"#{symbol.lower()} #{signal.lower()}"
-        )
-        self.send(msg_private)
+        # Reason — one short line from each strategy that fired
+        reasons = result.get("reason_lines", [])
+        reason_line = " · ".join(r.split("|")[0].strip() for r in reasons[:2]) if reasons else ""
 
-        # ── Channel: clean signal card ────────────────────────
-        emoji = "📈" if signal == "BUY" else "📉"
-        msg_channel = (
-            f"{emoji} <b>{signal} — {symbol}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Confidence:  <b>{conf:.0%}</b> | {consensus}/3 strategies\n"
+        msg = (
+            f"{emoji} <b>{signal} {symbol}</b>  {conf:.0%}  {consensus}/3"
+            f"{t_line}"
+            + (f"\n<i>{reason_line}</i>" if reason_line else "")
         )
-        if targets:
-            msg_channel += (
-                f"\n"
-                f"Entry:       <code>${targets.get('entry','?')}</code>\n"
-                f"Stop Loss:   <code>${targets.get('stop','?')}</code>\n"
-                f"Take Profit: <code>${targets.get('target','?')}</code>\n"
-            )
-        msg_channel += (
-            f"\n"
-            f"<i>ALPHARAGHU Signal | {datetime.now().strftime('%H:%M ET')}</i>\n"
-            f"#{symbol.lower()} #{signal.lower()} #alpharaghu"
-        )
-        self.send_to_channel(msg_channel)
+        self.send(msg)
+        self.send_to_channel(msg)
+
+        # ── Auto-chart on BUY ─────────────────────────────────
+        if signal == "BUY" and targets:
+            self._send_signal_chart(result, symbol, targets, conf, consensus)
+
         return True
+
+    def _send_signal_chart(self, result, symbol, targets, conf, consensus):
+        """Generate and send a candlestick chart for a BUY signal."""
+        try:
+            # Import chart generator
+            import importlib.util
+            cg_path = os.path.join(ROOT, "utils", "chart_generator.py")
+            if not os.path.exists(cg_path):
+                return
+            spec = importlib.util.spec_from_file_location("chart_generator", cg_path)
+            cg   = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(cg)
+
+            # Get bars via AlpacaClient (already imported in main.py)
+            # We reach into sys.modules to avoid circular imports
+            alpaca_mod = None
+            for mod_name, mod in sys.modules.items():
+                if hasattr(mod, "AlpacaClient"):
+                    alpaca_mod = mod
+                    break
+            if alpaca_mod is None:
+                logger.debug("[CHART] AlpacaClient not in sys.modules yet")
+                return
+
+            # Find the live alpaca instance via the engine
+            alpaca_client = None
+            for mod_name, mod in sys.modules.items():
+                if hasattr(mod, "_alpaca_instance"):
+                    alpaca_client = mod._alpaca_instance
+                    break
+
+            # Fallback: look for any object with get_bars
+            if alpaca_client is None:
+                for mod_name, mod in sys.modules.items():
+                    obj = getattr(mod, "alpaca_client", None) or getattr(mod, "alpaca", None)
+                    if obj and hasattr(obj, "get_bars"):
+                        alpaca_client = obj
+                        break
+
+            if alpaca_client is None:
+                logger.debug("[CHART] Could not find alpaca_client for charting")
+                return
+
+            # Fetch 5-min bars for the full session (~78 bars = 6.5 hrs)
+            df = alpaca_client.get_bars(symbol, timeframe="5Min", limit=78)
+            if df is None or (hasattr(df, "empty") and df.empty):
+                return
+
+            # Convert DataFrame to list of dicts
+            bars = []
+            for idx, row in df.iterrows():
+                bars.append({
+                    "timestamp": str(idx),
+                    "open":   float(row["open"]),
+                    "high":   float(row["high"]),
+                    "low":    float(row["low"]),
+                    "close":  float(row["close"]),
+                    "volume": float(row.get("volume", 0)),
+                })
+
+            png = cg.generate_chart(
+                symbol      = symbol,
+                bars        = bars,
+                entry       = float(targets.get("entry", 0)),
+                stop        = float(targets.get("stop",  0)),
+                target      = float(targets.get("target", 0)),
+                confidence  = conf,
+                consensus   = consensus,
+                signal_time = datetime.now().strftime("%H:%M ET"),
+            )
+
+            if png:
+                caption = (
+                    f"📈 <b>BUY {symbol}</b>  {conf:.0%}  {consensus}/3\n"
+                    f"EP <code>${targets.get('entry','??')}</code>  "
+                    f"SL <code>${targets.get('stop','??')}</code>  "
+                    f"TP <code>${targets.get('target','??')}</code>"
+                )
+                self.send_chart(symbol, png, caption)
+                logger.info(f"[CHART] Sent chart for {symbol}")
+
+        except Exception as e:
+            logger.error(f"[CHART] Chart pipeline error for {symbol}: {e}")
 
     # ── Order filled ─────────────────────────────────────────
     def send_order_fill(self, symbol: str, side: str, qty: float, price: float) -> bool:
-        action = "BOUGHT" if side == "buy" else "SOLD"
         emoji  = "✅" if side == "buy" else "🔴"
-
-        # Private chat — detailed
-        msg_private = (
-            f"<b>Order Filled — {action} {symbol}</b>\n"
-            f"Qty: {qty} shares\n"
-            f"Price: <code>${price:.2f}</code>\n"
-            f"Total: <code>${qty * price:,.2f}</code>\n"
-            f"Time: {datetime.now().strftime('%H:%M:%S')}"
+        action = "BOUGHT" if side == "buy" else "SOLD"
+        msg = (
+            f"{emoji} <b>{action} {symbol}</b>\n"
+            f"{qty:.0f} sh @ <code>${price:.2f}</code>  "
+            f"= <code>${qty * price:,.0f}</code>"
         )
-        self.send(msg_private)
-
-        # Channel — clean trade card
-        msg_channel = (
-            f"{emoji} <b>TRADE EXECUTED — {action} {symbol}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Shares: <b>{qty}</b> @ <code>${price:.2f}</code>\n"
-            f"Total:  <code>${qty * price:,.2f}</code>\n"
-            f"\n"
-            f"<i>ALPHARAGHU | {datetime.now().strftime('%H:%M ET')}</i>\n"
-            f"#{symbol.lower()} #{action.lower()} #alpharaghu"
-        )
-        self.send_to_channel(msg_channel)
+        self.send_both(msg)
         return True
 
     # ── Stopped message ──────────────────────────────────────
     def send_stopped(self, scan_count: int, signal_count: int, account=None) -> bool:
-        portfolio = "N/A"
-        positions = "N/A"
+        port = ""
         if account:
             try:
-                portfolio = f"${float(account.portfolio_value):,.2f}"
+                port = f"  ${float(account.portfolio_value):,.0f}"
             except Exception:
                 pass
-        msg = (
-            f"<b>Bot Stopped</b>\n\n"
-            f"Scans: {scan_count}\n"
-            f"Total signals: {signal_count}\n"
-            f"Final portfolio: {portfolio}\n"
-            f"Time: {datetime.now().strftime('%H:%M:%S')}"
-        )
+        msg = f"⏹ <b>Bot stopped</b>{port}  #{scan_count} scans  {signal_count} signals"
         return self.send(msg)
 
     # ── Portfolio summary ────────────────────────────────────
