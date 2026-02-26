@@ -1,15 +1,5 @@
 {
   "positions": {
-    "APA": {
-      "entry": 29.055,
-      "qty_original": 68.83,
-      "qty_remaining": 68.83,
-      "atr": 1.1936,
-      "partial_target": 32.64,
-      "partial_filled": false,
-      "trailing_stop": null,
-      "registered_at": "2026-02-24T09:51:49.771329"
-    },
     "SO": {
       "entry": 94.74,
       "qty_original": 21.11,
@@ -29,7 +19,27 @@
       "partial_filled": false,
       "trailing_stop": null,
       "registered_at": "2026-02-24T12:39:27.482968"
+    },
+    "FANG": {
+      "entry": 166.195,
+      "qty_original": 12.03,
+      "qty_remaining": 12.03,
+      "atr": 5.2679,
+      "partial_target": 182.0,
+      "partial_filled": false,
+      "trailing_stop": null,
+      "registered_at": "2026-02-25T13:19:46.958201"
+    },
+    "SLV": {
+      "entry": 82.495,
+      "qty_original": 24.24,
+      "qty_remaining": 24.24,
+      "atr": 5.2975,
+      "partial_target": 98.39,
+      "partial_filled": false,
+      "trailing_stop": null,
+      "registered_at": "2026-02-25T14:55:45.445162"
     }
   },
-  "saved_at": "2026-02-24T12:39:27.483400"
+  "saved_at": "2026-02-25T14:55:45.445597"
 }

@@ -78,6 +78,8 @@ class _RichHandler(logging.Handler):
         elif "PARTIAL EXIT" in raw or "PARTIAL SELL" in raw:
             _rcon.print(f"[dim]{ts}[/dim] [bold yellow]◑ PARTIAL EXIT[/bold yellow] [yellow]{raw}[/yellow]")
         # ── Scan header ─────────────────────────────────────
+        elif "--- Scan #" in raw and "done |" in raw:
+            _rcon.print(f"[dim]{ts}[/dim] [bold white]{raw}[/bold white]")
         elif "--- Scan #" in raw:
             _rcon.print(f"\n[dim]{ts}[/dim] [bold cyan]{raw}[/bold cyan]")
         # ── Symbol signal lines: "  APA: BUY | 35% | 2/3" ──
@@ -324,7 +326,7 @@ class AlpharaghuEngine:
         return symbols
 
     # ── Main scan ─────────────────────────────────────────────
-    def run_scan(self):
+    def run_scan(self, _cached_symbols=None):
         if is_paused():
             logger.info("Bot paused — skipping scan")
             return
@@ -350,7 +352,7 @@ class AlpharaghuEngine:
             return
 
         self.scan_count += 1
-        symbols        = self.get_symbols()
+        symbols        = _cached_symbols if _cached_symbols is not None else self.get_symbols()
         open_positions = self.alpaca.get_open_position_count()
         scan_signals   = []
         all_results    = []
@@ -361,17 +363,35 @@ class AlpharaghuEngine:
         self._manage_positions()
 
         # ── Scan for new signals ───────────────────────────────
+        _scan_buys  = 0
+        _scan_sells = 0
+        _scan_skips = 0
         for symbol in symbols:
             try:
                 result = self._analyze_symbol(symbol, open_positions)
                 if result:
                     all_results.append(result)
-                    if result.get("signal") in ("BUY", "SELL"):
+                    sig = result.get("signal")
+                    if sig == "BUY":
                         scan_signals.append(result)
                         self.signal_count += 1
+                        _scan_buys += 1
+                    elif sig == "SELL":
+                        scan_signals.append(result)
+                        self.signal_count += 1
+                        _scan_sells += 1
                 time.sleep(0.3)
             except Exception as e:
                 logger.error(f"Error on {symbol}: {e}")
+
+        # ── Scan stats ────────────────────────────────────────
+        _open_now = self.alpaca.get_open_position_count()
+        logger.info(
+            f"--- Scan #{self.scan_count} done | "
+            f"Signals: {_scan_buys}B/{_scan_sells}S | "
+            f"Positions open: {_open_now} | "
+            f"Total fills today: {self.signal_count}"
+        )
 
         # ── Telegram scan summary ──────────────────────────────
         try:
@@ -464,10 +484,12 @@ class AlpharaghuEngine:
         if signal == "HOLD":
             return result
 
-        # Deduplicate within 30 min
+        # Deduplicate within 30 min — same signal on same symbol, don't spam orders
         last = self.active_signals.get(symbol, {})
         if (last.get("signal") == signal and
                 (datetime.now() - last.get("time", datetime(2000,1,1))).seconds < 1800):
+            elapsed = int((datetime.now() - last.get("time", datetime.now())).seconds / 60)
+            logger.debug(f"  {symbol}: DEDUP — same {signal} seen {elapsed}m ago, skip")
             return result
 
         # ── Cooldown check ─────────────────────────────────────
@@ -600,26 +622,64 @@ class AlpharaghuEngine:
                 )
 
         # ── Staleness guard — validate signal price vs live price ─
+        # PRICE_STALENESS_WARN_PCT  (default 5%)  → warn + recalculate from live
+        # PRICE_DRIFT_ABORT_PCT     (default 25%) → abort order entirely
+        # Anything >25% drift is almost certainly a stock split or bad data,
+        # NOT a trading opportunity. The WEC bug (Feb 25) was caused by a
+        # 2-for-1 stock split producing 50% drift — Alpaca rejected the order.
         stale_pct = getattr(config, "PRICE_STALENESS_WARN_PCT", 5.0)
+        abort_pct = getattr(config, "PRICE_DRIFT_ABORT_PCT", 25.0)
+        _price_drift_ok = True     # set False to skip order
         try:
             live_q = self.alpaca.get_latest_quote(symbol)
             if live_q and live_q.get("mid"):
                 live_p = live_q["mid"]
                 drift  = abs(live_p - price) / price * 100
-                if drift > stale_pct:
+
+                # ── Hard abort: drift too large (split / bad data) ──
+                if drift >= abort_pct:
+                    _price_drift_ok = False
+                    logger.error(
+                        f"  {symbol}: DRIFT ABORT — {drift:.0f}% drift between "
+                        f"signal=${price:.2f} and live=${live_p:.2f}. "
+                        f"Possible stock split or corrupted bar data. "
+                        f"Order cancelled. Cooldown applied."
+                    )
+                    self.telegram.send(
+                        f"⚠️ <b>DRIFT ABORT: {symbol}</b>\n"
+                        f"Signal price: ${price:.2f}  Live: ${live_p:.2f}\n"
+                        f"Drift: {drift:.0f}% — possible stock split or bad data.\n"
+                        f"Order skipped. Cooldown applied. Please verify {symbol}."
+                    )
+                    self.risk.record_trade(symbol)   # apply cooldown immediately
+
+                elif drift > stale_pct:
                     logger.warning(
                         f"  {symbol}: STALE PRICE ALERT "
                         f"signal=${price:.2f} live=${live_p:.2f} "
                         f"({drift:.1f}% drift — recalculating ATR from live)"
                     )
+                    # When drift > 10%: pivot levels are also stale — discard them
+                    # and recalculate stop/target purely from live ATR
+                    if drift > 10.0:
+                        logger.info(
+                            f"  {symbol}: Drift {drift:.1f}% > 10% — "
+                            f"discarding stale pivot levels, using live ATR only"
+                        )
+                        stop_method = "live_ATR"  # override pivot-based labels
+
                     # Recalculate stops/targets from the live price
                     atr_live = self.alpaca.get_atr(symbol)
                     if atr_live > 0:
                         stop_price   = live_p - atr_live * getattr(config, "ATR_STOP_MULTIPLIER", 2.0)
                         target_price = live_p + atr_live * getattr(config, "ATR_TARGET_MULTIPLIER", 4.0)
                     price = live_p   # use live price as entry reference
+
         except Exception as _sg_e:
             logger.debug(f"  {symbol}: staleness check error: {_sg_e}")
+
+        if not _price_drift_ok:
+            return   # abort — do not place order
 
         qty = self.alpaca.calculate_position_size(price, stop_price, symbol=symbol)
 
@@ -650,6 +710,15 @@ class AlpharaghuEngine:
                     self.partial.register(symbol, price, qty, atr_val)
             except Exception as pe:
                 logger.error(f"  [PARTIAL] Register error for {symbol}: {pe}")
+
+        else:
+            # Order failed (API error, insufficient funds, etc.)
+            # Still apply cooldown so the same symbol isn't retried every scan
+            logger.warning(
+                f"  {symbol}: Order failed or rejected — "
+                f"applying cooldown to prevent immediate retry"
+            )
+            self.risk.record_trade(symbol)
 
     # ── Execute SELL ──────────────────────────────────────────
     def _execute_sell(self, symbol, price, result, position):
@@ -743,13 +812,16 @@ class AlpharaghuEngine:
     # ── Main loop ─────────────────────────────────────────────
     def run(self):
         logger.info("Engine starting...")
-        symbols     = self.get_symbols()
+        # Build symbol list ONCE — reuse for startup telegram + first scan
+        # This eliminates the double [SECTOR-SCAN] that previously fired on
+        # every restart (once in run(), once inside run_scan → get_symbols()).
+        startup_symbols = self.get_symbols()
         top_sectors = []
         try:
             top_sectors = self.sector.get_top_sectors()
         except Exception:
             pass
-        self.telegram.send_startup(len(config.WATCHLIST), symbols, top_sectors=top_sectors)
+        self.telegram.send_startup(len(config.WATCHLIST), startup_symbols, top_sectors=top_sectors)
 
         # Log existing positions
         positions = self.alpaca.get_positions()
@@ -765,7 +837,8 @@ class AlpharaghuEngine:
         schedule.every().day.at("09:31").do(self.risk.reset_daily)
         schedule.every().day.at("16:05").do(self.send_daily_summary)
 
-        self.run_scan()  # Immediate first scan
+        # First scan — pass pre-built symbols so get_symbols() isn't called twice
+        self.run_scan(_cached_symbols=startup_symbols)
 
         logger.info(f"Scanning every {config.SCAN_INTERVAL_MINUTES} min. Ctrl+C to stop.")
         try:
