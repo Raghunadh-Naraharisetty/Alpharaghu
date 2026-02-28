@@ -232,17 +232,6 @@ def log_signal_json(result):
 class AlpharaghuEngine:
 
     def __init__(self):
-        _print_banner()
-        logger.info("=" * 60)
-        logger.info("  ALPHARAGHU v4.0 - Algo Trading Engine")
-        logger.info("  + Earnings Filter | + Sector Rotation ")
-        logger.info("  + Partial Exits   | + Trail 2nd Half  ")
-        logger.info("  + Trailing Stops | + Drawdown Breaker")
-        logger.info("  + Trade Database | + MTF Trend Filter")
-        logger.info("  + pandas-ta       | + Rich Terminal   ")
-        logger.info("  + Plotly Charts   | + Backtester      ")
-        logger.info("=" * 60)
-
         self.alpaca   = AlpacaClient()
         self.telegram = TelegramBot()
         self.combiner = StrategyCombiner()
@@ -250,15 +239,16 @@ class AlpharaghuEngine:
         self.db       = TradeDatabase()
         self.risk     = RiskManager(self.alpaca)
 
-        # Print banner with live portfolio value now that we're connected
+        # Print banner once — after connection so portfolio value is live
         try:
             acct = self.alpaca.get_account()
             _print_banner(float(acct.portfolio_value))
         except Exception:
-            pass
+            _print_banner()
 
         self.scan_count   = 0
-        self.signal_count = 0
+        self.signal_count = 0   # signals detected (BUY+SELL across all scans)
+        self.fill_count   = 0   # actual order fills today
         self.active_signals = {}
 
         # ── New v4 modules ─────────────────────────────────────
@@ -390,7 +380,7 @@ class AlpharaghuEngine:
             f"--- Scan #{self.scan_count} done | "
             f"Signals: {_scan_buys}B/{_scan_sells}S | "
             f"Positions open: {_open_now} | "
-            f"Total fills today: {self.signal_count}"
+            f"Fills today: {self.fill_count}"
         )
 
         # ── Telegram scan summary ──────────────────────────────
@@ -701,6 +691,7 @@ class AlpharaghuEngine:
             )
             self.risk.record_trade(symbol)
             logger.info(f"  [BUY FILLED] {qty:.2f}x {symbol} @ ~${price:.2f}")
+            self.fill_count += 1
             self.telegram.send_signal(result)
 
             # Register with partial exit manager for 50%/trail management
@@ -730,6 +721,7 @@ class AlpharaghuEngine:
             logger.info(f"  [SELL FILLED] {symbol} | P&L: ${pl:+.2f}")
         except Exception:
             logger.info(f"  [SELL FILLED] {symbol}")
+        self.fill_count += 1
         self.telegram.send_signal(result)
 
     # ── Daily jobs ────────────────────────────────────────────

@@ -20,26 +20,26 @@
       "trailing_stop": null,
       "registered_at": "2026-02-24T12:39:27.482968"
     },
-    "FANG": {
-      "entry": 166.195,
-      "qty_original": 12.03,
-      "qty_remaining": 12.03,
-      "atr": 5.2679,
-      "partial_target": 182.0,
+    "OXY": {
+      "entry": 51.51,
+      "qty_original": 38.83,
+      "qty_remaining": 38.83,
+      "atr": 1.7594,
+      "partial_target": 56.79,
       "partial_filled": false,
       "trailing_stop": null,
-      "registered_at": "2026-02-25T13:19:46.958201"
+      "registered_at": "2026-02-26T14:45:47.798563"
     },
-    "SLV": {
-      "entry": 82.495,
-      "qty_original": 24.24,
-      "qty_remaining": 24.24,
-      "atr": 5.2975,
-      "partial_target": 98.39,
+    "CLX": {
+      "entry": 127.0,
+      "qty_original": 15.75,
+      "qty_remaining": 15.75,
+      "atr": 3.3218,
+      "partial_target": 136.97,
       "partial_filled": false,
       "trailing_stop": null,
-      "registered_at": "2026-02-25T14:55:45.445162"
+      "registered_at": "2026-02-26T15:18:33.843923"
     }
   },
-  "saved_at": "2026-02-25T14:55:45.445597"
+  "saved_at": "2026-02-27T13:54:57.388301"
 }

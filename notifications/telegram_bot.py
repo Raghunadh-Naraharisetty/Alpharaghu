@@ -245,7 +245,31 @@ class TelegramBot:
         ))):
             lines.insert(0, f"<b>Scan #{scan_num}</b>  {now}")
 
-        return self.send("\n".join(lines))
+        msg = "\n".join(lines)
+        self.send(msg)  # always goes to private chat
+
+        # ── Push signals to channel too (SELL signals are often missed) ──
+        if signals:
+            channel_lines = []
+            for s in sig_buy:
+                t  = s.get("targets", {})
+                ep = f"${t['entry']}" if t.get("entry") else "mkt"
+                sl = f"${t['stop']}"  if t.get("stop")  else "—"
+                tp = f"${t['target']}"if t.get("target") else "—"
+                channel_lines.append(
+                    f"📈 <b>BUY {s['symbol']}</b>  {s.get('confidence',0):.0%}\n"
+                    f"   EP {ep}  SL {sl}  TP {tp}"
+                )
+            for s in sig_sell:
+                channel_lines.append(
+                    f"📉 <b>SELL {s['symbol']}</b>  {s.get('confidence',0):.0%}\n"
+                    f"   <i>Signal detected — pending MTF/filter check</i>"
+                )
+            if channel_lines:
+                channel_lines.insert(0, f"<b>Scan #{scan_num}</b>  {now}")
+                self.send_to_channel("\n".join(channel_lines))
+
+        return True
 
     # ── Trade signal ─────────────────────────────────────────
     def send_signal(self, result: dict) -> bool:
